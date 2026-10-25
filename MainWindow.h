@@ -43,6 +43,9 @@ public:
     // 打开启动参数/外部调用指定的压缩包（例如 StarZip.exe archive.zip）。
     void openArchivePath(const QString &path);
 
+    // 解析命令行：--extract-here / --extract-to / --test / --compress。
+    void applyStartupArguments(const QStringList &arguments);
+
 protected:
     void dragEnterEvent(QDragEnterEvent *event) override;
     void dragMoveEvent(QDragMoveEvent *event) override;
@@ -73,6 +76,8 @@ private slots:
     void showArchiveContextMenu(const QPoint &pos);
     void showLogTab();
     void showAbout();
+    void installShellIntegration();
+    void removeShellIntegration();
 
     void onWorkerProgress(int percent, const QString &detail);
     void onPasswordRequired(int operation, const QString &archivePath);
@@ -82,6 +87,13 @@ private slots:
                           int errorCode, const QString &outputPath);
 
 private:
+    enum class StartupAction {
+        None,
+        ExtractHere,
+        ExtractTo,
+        Test
+    };
+
     struct FormatChoice {
         QString id;
         QString label;
@@ -106,6 +118,7 @@ private:
 
     void openArchive(const QString &path, const QString &password = QString(),
                      bool retry = false);
+    void runStartupAction();
     void startExtraction(const QString &destination, const QStringList &onlyPaths,
                          const QString &password, bool retry = false);
     void startTest(const QString &password, bool retry = false);
@@ -205,6 +218,8 @@ private:
     QAction *m_logAction = nullptr;
     QAction *m_aboutAction = nullptr;
     QAction *m_exitAction = nullptr;
+    QAction *m_shellInstallAction = nullptr;
+    QAction *m_shellRemoveAction = nullptr;
     QToolBar *m_toolBar = nullptr;
     QMenu *m_recentMenu = nullptr;
 
@@ -221,6 +236,7 @@ private:
     bool m_closing = false;
     bool m_passwordSignal = false;
     int m_passwordAttempts = 0;
+    StartupAction m_startupAction = StartupAction::None;
     ArchiveWorker::Operation m_currentOperation = ArchiveWorker::List;
     QPointer<QThread> m_thread;
     QPointer<ArchiveWorker> m_worker;

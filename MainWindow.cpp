@@ -1,5 +1,8 @@
 #include "MainWindow.h"
 
+#include "ExternalEngine.h"
+#include "ShellIntegration.h"
+
 #include <QAbstractItemView>
 #include <QAction>
 #include <QApplication>
@@ -38,6 +41,7 @@
 #include <QStyle>
 #include <QTabWidget>
 #include <QThread>
+#include <QTimer>
 #include <QToolBar>
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
@@ -95,18 +99,44 @@ MainWindow::MainWindow(QWidget *parent)
 
     QSettings settings;
     const QByteArray geometry = settings.value(QStringLiteral("windowGeometry")).toByteArray();
-    if (!geometry.isEmpty())
+    if (!geometry.isEmpty()) {
         restoreGeometry(geometry);
+        // 旧版本保存过 1120×780 的大窗口；启动时收敛到紧凑尺寸。
+        if (isMaximized() || isFullScreen())
+            setWindowState(Qt::WindowNoState);
+        if (width() > 980 || height() > 700)
+            resize(900, 600);
+    }
 
     m_extractTarget = QDir::currentPath();
     m_targetEdit->setText(QDir::toNativeSeparators(m_extractTarget));
     m_targetEdit->setToolTip(QStringLiteral("默认解压到 StarZip 启动时的当前目录：%1")
                                  .arg(QDir::toNativeSeparators(m_extractTarget)));
 
-    appendLog(QStringLiteral("StarZip 0.0.2 已启动。"));
+#ifdef Q_OS_WIN
+    // 首次运行自动注册当前用户的右键菜单与“打开方式”条目，无需管理员权限。
+    if (ShellIntegration::supported()
+        && !settings.value(QStringLiteral("shellIntegration/autoInstalled"), false).toBool()) {
+        QString shellError;
+        if (ShellIntegration::install(&shellError)) {
+            settings.setValue(QStringLiteral("shellIntegration/autoInstalled"), true);
+            settings.sync();
+            appendLog(QStringLiteral("已添加资源管理器右键菜单：解压到当前文件夹 / 解压到… / "
+                                     "使用 StarZip 压缩。"));
+        } else {
+            appendLog(QStringLiteral("添加资源管理器右键菜单失败：%1").arg(shellError));
+        }
+    }
+#endif
+
+    appendLog(QStringLiteral("StarZip 0.0.3 已启动。"));
     appendLog(QStringLiteral("读取：ZIP / 7Z / RAR / RAR5 / TAR / GZ / XZ / CAB / ISO；"
                              "创建：ZIP / 7Z / TAR / TAR.GZ / TAR.XZ。"));
     appendLog(QStringLiteral("密码：ZIP 支持 AES-256 写入；加密 ZIP / 7Z / RAR 可输入密码解压。"));
+    appendLog(ExternalEngine::available()
+                  ? QStringLiteral("7-Zip 引擎：%1（支持 UDF ISO 与加密 7Z）")
+                        .arg(ExternalEngine::executablePath())
+                  : QStringLiteral("7-Zip 引擎未找到：UDF ISO 与加密 7Z 将不可用。"));
     rebuildRecentMenu();
     statusBar()->showMessage(QStringLiteral("就绪 — 拖入压缩包，或点击“打开压缩包…”"));
     updateActions();
@@ -124,10 +154,10 @@ MainWindow::~MainWindow()
 
 void MainWindow::setupUi()
 {
-    setWindowTitle(QStringLiteral("StarZip 0.0.2"));
+    setWindowTitle(QStringLiteral("StarZip 0.0.3"));
     setWindowIcon(makeAppIcon());
-    resize(1120, 780);
-    setMinimumSize(920, 640);
+    resize(900, 600);
+    setMinimumSize(760, 500);
     setAcceptDrops(true);
 
     setupActions();
@@ -218,7 +248,7 @@ void MainWindow::setupUi()
     statusBar()->showMessage(QStringLiteral("就绪"));
     m_statusFormatLabel = new QLabel(QStringLiteral("格式：—"), this);
     m_statusCountLabel = new QLabel(QStringLiteral("条目：—"), this);
-    auto *versionLabel = new QLabel(QStringLiteral("StarZip 0.0.2"), this);
+    auto *versionLabel = new QLabel(QStringLiteral("StarZip 0.0.3"), this);
     statusBar()->addPermanentWidget(m_statusFormatLabel);
     statusBar()->addPermanentWidget(m_statusCountLabel);
     statusBar()->addPermanentWidget(versionLabel);
@@ -305,6 +335,14 @@ void MainWindow::setupActions()
     m_exitAction->setShortcut(QKeySequence::Quit);
     connect(m_exitAction, &QAction::triggered, this, &QWidget::close);
 
+    m_shellInstallAction = new QAction(QStringLiteral("安装/修复资源管理器右键菜单"), this);
+    connect(m_shellInstallAction, &QAction::triggered, this,
+            &MainWindow::installShellIntegration);
+
+    m_shellRemoveAction = new QAction(QStringLiteral("移除资源管理器右键菜单"), this);
+    connect(m_shellRemoveAction, &QAction::triggered, this,
+            &MainWindow::removeShellIntegration);
+
     addAction(m_openAction);
     addAction(m_newAction);
     addAction(m_extractHereAction);
@@ -341,6 +379,10 @@ void MainWindow::setupMenus()
     QMenu *viewMenu = menuBar()->addMenu(QStringLiteral("视图(&V)"));
     viewMenu->addAction(m_logAction);
 
+    QMenu *toolsMenu = menuBar()->addMenu(QStringLiteral("工具(&T)"));
+    toolsMenu->addAction(m_shellInstallAction);
+    toolsMenu->addAction(m_shellRemoveAction);
+
     QMenu *helpMenu = menuBar()->addMenu(QStringLiteral("帮助(&H)"));
     helpMenu->addAction(m_aboutAction);
 }
@@ -355,7 +397,7 @@ void MainWindow::setupToolBar()
     m_toolBar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
 
     auto *brand = new QLabel(QStringLiteral("<b>StarZip</b> "
-                                            "<span style='color:#6b7280;font-weight:normal'>0.0.2</span>"),
+                                            "<span style='color:#6b7280;font-weight:normal'>0.0.3</span>"),
                              m_toolBar);
     brand->setObjectName(QStringLiteral("brandLabel"));
     brand->setContentsMargins(6, 0, 14, 0);
@@ -905,6 +947,7 @@ void MainWindow::openArchivePath(const QString &path)
         return;
     const QFileInfo info(path);
     if (!info.exists() || !info.isFile()) {
+        m_startupAction = StartupAction::None;
         showError(QStringLiteral("无法打开压缩包"),
                   QStringLiteral("文件不存在或不是普通文件：\n%1")
                       .arg(QDir::toNativeSeparators(path)));
@@ -912,6 +955,81 @@ void MainWindow::openArchivePath(const QString &path)
     }
     m_tabs->setCurrentWidget(m_archivePage);
     openArchive(info.absoluteFilePath());
+}
+
+void MainWindow::applyStartupArguments(const QStringList &arguments)
+{
+    m_startupAction = StartupAction::None;
+
+    for (int i = 1; i < arguments.size(); ++i) {
+        const QString arg = arguments.at(i);
+
+        if (arg == QStringLiteral("--compress")) {
+            bool added = false;
+            while (i + 1 < arguments.size()
+                   && !arguments.at(i + 1).startsWith(QStringLiteral("--"))) {
+                const QFileInfo info(arguments.at(++i));
+                if (!info.exists()) {
+                    appendLog(QStringLiteral("忽略不存在的路径：%1")
+                                  .arg(QDir::toNativeSeparators(info.absoluteFilePath())));
+                    continue;
+                }
+                addSourcePath(info.absoluteFilePath());
+                added = true;
+            }
+            if (added) {
+                m_tabs->setCurrentWidget(m_compressPage);
+                refreshSourcesSummary();
+            }
+            continue;
+        }
+
+        if (arg == QStringLiteral("--extract-here") || arg == QStringLiteral("--extract-to")
+            || arg == QStringLiteral("--test")) {
+            if (i + 1 >= arguments.size())
+                continue;
+            const QString path = arguments.at(++i);
+            m_startupAction = arg == QStringLiteral("--extract-here")
+                                  ? StartupAction::ExtractHere
+                                  : (arg == QStringLiteral("--extract-to")
+                                         ? StartupAction::ExtractTo
+                                         : StartupAction::Test);
+            openArchivePath(path);
+            continue;
+        }
+
+        if (arg.startsWith(QLatin1Char('-')))
+            continue;
+
+        const QFileInfo info(arg);
+        if (info.exists() && info.isFile())
+            openArchivePath(info.absoluteFilePath());
+    }
+}
+
+void MainWindow::runStartupAction()
+{
+    if (m_startupAction == StartupAction::None || m_archivePath.isEmpty())
+        return;
+
+    const StartupAction action = m_startupAction;
+    m_startupAction = StartupAction::None;
+
+    if (action == StartupAction::ExtractHere) {
+        const QFileInfo archiveInfo(m_archivePath);
+        QString base = archiveInfo.completeBaseName();
+        if (base.isEmpty())
+            base = QStringLiteral("StarZip_extracted");
+        const QString destination =
+            QDir(archiveInfo.absolutePath()).filePath(base);
+        m_extractTarget = QDir(destination).absolutePath();
+        m_targetEdit->setText(QDir::toNativeSeparators(m_extractTarget));
+        startExtraction(m_extractTarget, QStringList(), m_archivePassword);
+    } else if (action == StartupAction::ExtractTo) {
+        extractToChosen();
+    } else if (action == StartupAction::Test) {
+        startTest(m_archivePassword);
+    }
 }
 
 void MainWindow::chooseArchive()
@@ -970,7 +1088,7 @@ void MainWindow::openArchive(const QString &path, const QString &password, bool 
     m_tabs->setCurrentWidget(m_archivePage);
     m_statusFormatLabel->setText(QStringLiteral("格式：读取中"));
     m_statusCountLabel->setText(QStringLiteral("条目：—"));
-    setWindowTitle(QStringLiteral("StarZip 0.0.2 — %1").arg(archiveDisplayName(m_archivePath)));
+    setWindowTitle(QStringLiteral("StarZip 0.0.3 — %1").arg(archiveDisplayName(m_archivePath)));
     appendLog(QStringLiteral("打开压缩包：%1").arg(QDir::toNativeSeparators(m_archivePath)));
 
     const QString archivePath = m_archivePath;
@@ -1258,7 +1376,7 @@ QVector<MainWindow::FormatChoice> MainWindow::formatChoices()
         {QStringLiteral("zip"), QStringLiteral("ZIP（.zip）"), QStringLiteral(".zip"),
          QStringLiteral("ZIP 压缩包 (*.zip)"), true, true},
         {QStringLiteral("7z"), QStringLiteral("7Z（.7z）"), QStringLiteral(".7z"),
-         QStringLiteral("7Z 压缩包 (*.7z)"), false, true},
+         QStringLiteral("7Z 压缩包 (*.7z)"), ExternalEngine::available(), true},
         {QStringLiteral("tar"), QStringLiteral("TAR（.tar）"), QStringLiteral(".tar"),
          QStringLiteral("TAR 归档 (*.tar)"), false, false},
         {QStringLiteral("tar.gz"), QStringLiteral("TAR.GZ（.tar.gz）"), QStringLiteral(".tar.gz"),
@@ -1305,7 +1423,10 @@ void MainWindow::onFormatChanged()
         m_passwordNote->setText(QStringLiteral("ZIP 支持 AES-256 密码；如果运行库不支持，"
                                                "会自动回退到 ZipCrypto。"));
     } else if (choice.id == QStringLiteral("7z")) {
-        m_passwordNote->setText(QStringLiteral("7Z 写入暂不支持密码；如需密码请选择 ZIP。"));
+        m_passwordNote->setText(
+            ExternalEngine::available()
+                ? QStringLiteral("7Z 密码由 7-Zip 引擎写入（AES-256）；留空则不加密。")
+                : QStringLiteral("未找到 7-Zip 引擎，7Z 暂不能设置密码；请选择 ZIP。"));
     } else {
         m_passwordNote->setText(QStringLiteral("TAR 系列不支持密码，适合跨平台归档。"));
     }
@@ -1636,16 +1757,71 @@ void MainWindow::showAbout()
     box.setIcon(QMessageBox::Information);
     box.setTextFormat(Qt::RichText);
     box.setText(QStringLiteral(
-        "<h3>StarZip 0.0.2</h3>"
+        "<h3>StarZip 0.0.3</h3>"
         "<p>C++17 · Qt 6 Widgets · libarchive</p>"
-        "<p>读取：ZIP / 7Z / RAR / RAR5 / TAR / GZ / XZ / CAB / ISO<br>"
+        "<p>读取：ZIP / 7Z / RAR / RAR5 / TAR / GZ / XZ / CAB / ISO / UDF ISO<br>"
         "创建：ZIP / 7Z / TAR / TAR.GZ / TAR.XZ<br>"
-        "密码：ZIP AES-256 写入；加密包读取时可输入密码</p>"
+        "密码：ZIP AES-256 写入；7Z 密码由 7-Zip 引擎写入；加密包读取时可输入密码<br>"
+        "集成：Windows 资源管理器右键菜单 / 打开方式</p>"
         "<p>GitHub：<a href='https://github.com/wbzmm2025/StarZip'>"
         "github.com/wbzmm2025/StarZip</a></p>"
-        "<p style='color:#6b7280'>0.0.1 源码已开源；0.0.2 增加多格式压缩、密码与全新界面。</p>"));
+        "<p style='color:#6b7280'>0.0.3：右键菜单、UDF ISO、加密 7Z 与紧凑窗口。</p>"));
     box.setStandardButtons(QMessageBox::Ok);
     box.exec();
+}
+
+void MainWindow::installShellIntegration()
+{
+#ifdef Q_OS_WIN
+    QString error;
+    if (ShellIntegration::install(&error)) {
+        QSettings settings;
+        settings.setValue(QStringLiteral("shellIntegration/autoInstalled"), true);
+        settings.sync();
+        appendLog(QStringLiteral("资源管理器右键菜单已安装/修复。"));
+        QMessageBox::information(
+            this, QStringLiteral("右键菜单已就绪"),
+            QStringLiteral("已为当前用户添加 StarZip 菜单：\n\n"
+                           "• 压缩包：使用 StarZip 打开 / 解压到当前文件夹 / 解压到…\n"
+                           "• 任意文件或文件夹：使用 StarZip 压缩…\n\n"
+                           "如果资源管理器仍显示旧菜单，请注销或重启资源管理器。"));
+    } else {
+        appendLog(QStringLiteral("安装右键菜单失败：%1").arg(error));
+        showError(QStringLiteral("安装失败"), error);
+    }
+#else
+    QMessageBox::information(this, QStringLiteral("不支持"),
+                             QStringLiteral("资源管理器集成仅支持 Windows。"));
+#endif
+}
+
+void MainWindow::removeShellIntegration()
+{
+#ifdef Q_OS_WIN
+    const QMessageBox::StandardButton answer = QMessageBox::question(
+        this, QStringLiteral("移除右键菜单"),
+        QStringLiteral("确定移除当前用户的 StarZip 右键菜单和“打开方式”条目吗？\n"
+                       "不会删除任何压缩包或程序文件。"),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+    if (answer != QMessageBox::Yes)
+        return;
+
+    QString error;
+    if (ShellIntegration::uninstall(&error)) {
+        QSettings settings;
+        settings.setValue(QStringLiteral("shellIntegration/autoInstalled"), true);
+        settings.sync();
+        appendLog(QStringLiteral("资源管理器右键菜单已移除。"));
+        QMessageBox::information(this, QStringLiteral("已移除"),
+                                 QStringLiteral("当前用户的 StarZip 右键菜单已移除。"));
+    } else {
+        appendLog(QStringLiteral("移除右键菜单失败：%1").arg(error));
+        showError(QStringLiteral("移除失败"), error);
+    }
+#else
+    QMessageBox::information(this, QStringLiteral("不支持"),
+                             QStringLiteral("资源管理器集成仅支持 Windows。"));
+#endif
 }
 
 void MainWindow::onWorkerProgress(int percent, const QString &detail)
@@ -1715,8 +1891,10 @@ void MainWindow::onWorkerFinished(int operation, bool success, bool canceled,
     if (canceled) {
         m_progressBar->setValue(0);
         m_progressLabel->setText(QStringLiteral("已取消"));
-        if (operation == ArchiveWorker::List)
+        if (operation == ArchiveWorker::List) {
+            m_startupAction = StartupAction::None;
             resetArchiveState();
+        }
         statusBar()->showMessage(QStringLiteral("操作已取消。"), 6000);
         appendLog(QStringLiteral("操作已取消。"));
         updateActions();
@@ -1780,6 +1958,8 @@ void MainWindow::onWorkerFinished(int operation, bool success, bool canceled,
         statusBar()->showMessage(message, 8000);
         m_progressLabel->setText(QStringLiteral("就绪"));
         appendLog(message);
+        if (m_startupAction != StartupAction::None)
+            QTimer::singleShot(0, this, &MainWindow::runStartupAction);
     } else {
         m_progressBar->setValue(100);
         m_progressLabel->setText(QStringLiteral("完成"));
@@ -1852,6 +2032,7 @@ void MainWindow::resetArchiveState()
     m_archivePassword.clear();
     m_formatName.clear();
     m_entries.clear();
+    m_startupAction = StartupAction::None;
     m_passwordAttempts = 0;
     m_passwordSignal = false;
     if (m_archiveTree)
@@ -1874,7 +2055,7 @@ void MainWindow::resetArchiveState()
     m_formatBadge->setText(QStringLiteral("—"));
     m_statusFormatLabel->setText(QStringLiteral("格式：—"));
     m_statusCountLabel->setText(QStringLiteral("条目：—"));
-    setWindowTitle(QStringLiteral("StarZip 0.0.2"));
+    setWindowTitle(QStringLiteral("StarZip 0.0.3"));
     updateActions();
 }
 

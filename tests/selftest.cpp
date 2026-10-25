@@ -4,6 +4,8 @@
 //   ZIP 密码（AES-256 / ZipCrypto）、选择性解压、路径穿越防护，
 //   以及外部传入的 7Z / RAR / RAR5 等压缩包读取路径。
 #include "ArchiveWorker.h"
+#include "ExternalEngine.h"
+#include "ShellIntegration.h"
 
 #include <QCoreApplication>
 #include <QCryptographicHash>
@@ -319,11 +321,58 @@ int main(int argc, char *argv[])
     CompressOptions pwd7z;
     pwd7z.format = QStringLiteral("7z");
     pwd7z.password = QStringLiteral("x");
-    r = runCompress(sources, work + QStringLiteral("/pwd.7z"), pwd7z);
-    check(!r.success && r.message.contains(QStringLiteral("ZIP")),
-          QStringLiteral("7Z 设置密码被明确拒绝：%1").arg(r.message));
+    const QString pwd7zPath = work + QStringLiteral("/pwd.7z");
+    r = runCompress(sources, pwd7zPath, pwd7z);
+    if (ExternalEngine::available()) {
+        check(r.success && QFileInfo::exists(pwd7zPath),
+              QStringLiteral("7Z 设置密码由 7-Zip 引擎创建：%1").arg(r.message));
+
+        const QString noPwdDest = work + QStringLiteral("/pwd7z-nopwd");
+        r = runExtract(pwd7zPath, noPwdDest);
+        check(!r.success || r.passwordRequests > 0,
+              QStringLiteral("无密码解压加密 7Z 被拒绝或请求密码"));
+
+        const QString pwdDest = work + QStringLiteral("/pwd7z-ok");
+        r = runExtract(pwd7zPath, pwdDest, QStringLiteral("x"));
+        check(r.success && QFileInfo::exists(pwdDest + QStringLiteral("/源目录/二进制数据.bin")),
+              QStringLiteral("正确密码可解压 7Z：%1").arg(r.message));
+        r = runTest(pwd7zPath, QStringLiteral("x"));
+        check(r.success, QStringLiteral("加密 7Z 测试通过"));
+    } else {
+        check(!r.success && r.message.contains(QStringLiteral("7-Zip")),
+              QStringLiteral("缺少 7-Zip 引擎时 7Z 密码被明确拒绝：%1").arg(r.message));
+    }
 
     // ---------- 8. 路径穿越（Zip Slip）防护 ----------
+    if (qEnvironmentVariableIsSet("STARZIP_TEST_SHELL")) {
+        QString shellError;
+        const bool ok = ShellIntegration::install(&shellError);
+        check(ok, QStringLiteral("资源管理器集成安装成功：%1").arg(shellError));
+        check(ShellIntegration::installed(), QStringLiteral("资源管理器集成注册表可检测"));
+
+        const bool doUninstall = qEnvironmentVariableIntValue("STARZIP_TEST_SHELL_UNINSTALL") != 0;
+        if (doUninstall) {
+            shellError.clear();
+            const bool removed = ShellIntegration::uninstall(&shellError);
+            check(removed, QStringLiteral("资源管理器集成移除成功：%1").arg(shellError));
+            check(!ShellIntegration::installed(),
+                  QStringLiteral("资源管理器集成移除后注册表可检测"));
+        }
+    }
+
+    // 可选：设置 STARZIP_UDF_ISO 指向真实 Windows 安装 ISO，验证 UDF 目录树。
+    const QString udfIso = qEnvironmentVariable("STARZIP_UDF_ISO");
+    if (!udfIso.isEmpty() && QFileInfo::exists(udfIso) && ExternalEngine::available()) {
+        r = runList(udfIso);
+        check(r.success && r.entryCount > 20,
+              QStringLiteral("UDF ISO 通过 7-Zip 引擎列出真实目录树（%1 个条目）")
+                  .arg(r.entryCount));
+        check(r.format.contains(QStringLiteral("UDF")),
+              QStringLiteral("UDF ISO 识别为 UDF：%1").arg(r.format));
+        r = runTest(udfIso);
+        check(r.success, QStringLiteral("UDF ISO 测试通过"));
+    }
+
     const QString slipZip = QCoreApplication::applicationDirPath()
                             + QStringLiteral("/../tests/samples/zip-slip.zip");
     if (QFileInfo::exists(slipZip)) {

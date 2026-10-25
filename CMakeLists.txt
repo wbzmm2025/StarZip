@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(StarZip VERSION 0.0.2 LANGUAGES CXX)
+project(StarZip VERSION 0.0.3 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -48,10 +48,20 @@ qt_add_executable(StarZip
     MainWindow.cpp
     ArchiveWorker.h
     ArchiveWorker.cpp
+    ExternalEngine.h
+    ExternalEngine.cpp
+    ShellIntegration.h
+    ShellIntegration.cpp
 )
 
 target_link_libraries(StarZip PRIVATE Qt6::Widgets)
 starzip_link_libarchive(StarZip)
+
+if(WIN32)
+    target_link_libraries(StarZip PRIVATE shell32)
+endif()
+
+set(STARZIP_7ZIP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/7zip")
 
 if(MSVC)
     target_compile_options(StarZip PRIVATE /W4 /permissive-)
@@ -65,6 +75,11 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 $<TARGET_RUNTIME_DLLS:StarZip>
                 $<TARGET_FILE_DIR:StarZip>
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${STARZIP_7ZIP_DIR}/7z.exe"
+                "${STARZIP_7ZIP_DIR}/7z.dll"
+                "${STARZIP_7ZIP_DIR}/License.txt"
+                $<TARGET_FILE_DIR:StarZip>
         COMMAND_EXPAND_LISTS
         VERBATIM
     )
@@ -75,9 +90,16 @@ if(STARZIP_BUILD_TESTS)
         tests/selftest.cpp
         ArchiveWorker.h
         ArchiveWorker.cpp
+        ExternalEngine.h
+        ExternalEngine.cpp
+        ShellIntegration.h
+        ShellIntegration.cpp
     )
     target_include_directories(StarZipSelfTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(StarZipSelfTest PRIVATE Qt6::Core)
+    if(WIN32)
+        target_link_libraries(StarZipSelfTest PRIVATE shell32)
+    endif()
     starzip_link_libarchive(StarZipSelfTest)
 endif()
 
@@ -86,6 +108,23 @@ install(TARGETS StarZip
     BUNDLE DESTINATION .
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
+
+if(WIN32)
+    # 安装时从构建目录复制本程序直接/间接依赖的 DLL（libarchive、lzma、zlib 等）。
+    install(CODE "
+        file(GLOB _starzip_runtime_dlls \"${CMAKE_BINARY_DIR}/*.dll\")
+        if(_starzip_runtime_dlls)
+            file(INSTALL DESTINATION \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}\"
+                 TYPE FILE FILES \${_starzip_runtime_dlls})
+        endif()
+    ")
+    install(FILES
+        "${STARZIP_7ZIP_DIR}/7z.exe"
+        "${STARZIP_7ZIP_DIR}/7z.dll"
+        "${STARZIP_7ZIP_DIR}/License.txt"
+        DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+endif()
 
 if(WIN32)
     qt_generate_deploy_app_script(

@@ -1,5 +1,7 @@
 #include "ArchiveWorker.h"
 
+#include "ExternalEngine.h"
+
 #include <QDir>
 #include <QDirIterator>
 #include <QElapsedTimer>
@@ -586,6 +588,39 @@ void ArchiveWorker::listArchive(const QString &archivePath, const QString &passw
 {
     resetCancel();
 
+    // UDF 光盘映像（Windows 安装盘等）libarchive 只认得出 ISO9660 兼容层，
+    // 必须交给 7-Zip 引擎读取完整目录树。
+    // libarchive 3.8 无法读取 AES 加密的 7Z 内容，带密码的 7Z 也改用 7-Zip 引擎。
+    const bool isUdf = ExternalEngine::isUdfIso(archivePath);
+    const bool isEncrypted7z =
+        !password.isEmpty()
+        && QFileInfo(archivePath).suffix().compare(QStringLiteral("7z"), Qt::CaseInsensitive) == 0;
+    if (isUdf || (isEncrypted7z && ExternalEngine::available())) {
+        QVector<ArchiveEntry> entries;
+        QString formatName;
+        QString error;
+        qint64 totalBytes = 0;
+        int entryCount = 0;
+        bool truncated = false;
+        bool canceled = false;
+        emit progress(0, QStringLiteral("正在使用 7-Zip 引擎读取%1…")
+                             .arg(isUdf ? QStringLiteral(" UDF 光盘映像")
+                                        : QStringLiteral("加密 7Z")));
+        if (!ExternalEngine::list(archivePath, password, &entries, &formatName, &totalBytes,
+                                  &entryCount, &truncated, &error, &m_cancelRequested,
+                                  &canceled)) {
+            emit finished(List, false, canceled, error, 0, archivePath);
+            return;
+        }
+        emit listed(entries, formatName, totalBytes, entryCount, truncated);
+        emit finished(List, true, false,
+                      QStringLiteral("已识别 %1 个条目，格式：%2（7-Zip 引擎）")
+                          .arg(entryCount)
+                          .arg(formatName),
+                      0, archivePath);
+        return;
+    }
+
     QFile file(archivePath);
     if (!file.open(QIODevice::ReadOnly)) {
         emit finished(List, false, false,
@@ -712,6 +747,38 @@ void ArchiveWorker::extractArchive(const QString &archivePath, const QString &de
         emit finished(Extract, false, false,
                       QStringLiteral("解压目标不是目录：%1")
                           .arg(QDir::toNativeSeparators(destAbsolute)),
+                      0, destAbsolute);
+        return;
+    }
+
+    const bool isUdf = ExternalEngine::isUdfIso(archivePath);
+    const bool isEncrypted7z =
+        !password.isEmpty()
+        && QFileInfo(archivePath).suffix().compare(QStringLiteral("7z"), Qt::CaseInsensitive) == 0;
+    if (isUdf || (isEncrypted7z && ExternalEngine::available())) {
+        ExternalEngine::ProgressCallback callback;
+        callback.report = [this](int percent, const QString &detail) {
+            emit progress(percent, detail);
+        };
+        QString error;
+        bool canceled = false;
+        emit progress(0, QStringLiteral("正在使用 7-Zip 引擎解压%1…")
+                             .arg(isUdf ? QStringLiteral(" UDF 光盘映像")
+                                        : QStringLiteral("加密 7Z")));
+        if (!ExternalEngine::extract(archivePath, destAbsolute, onlyPaths, password, &error,
+                                     callback, &m_cancelRequested, &canceled)) {
+            if (isEncrypted7z && !canceled
+                && error.contains(QStringLiteral("password"), Qt::CaseInsensitive))
+                emit passwordRequired(Extract, archivePath);
+            emit finished(Extract, false, canceled, error, 0, destAbsolute);
+            return;
+        }
+        emit progress(100, QStringLiteral("解压完成"));
+        emit finished(Extract, true, false,
+                      QStringLiteral("解压完成（%1，使用 7-Zip 引擎）。\n目标目录：%2")
+                          .arg(isUdf ? QStringLiteral("UDF 光盘映像")
+                                     : QStringLiteral("加密 7Z"),
+                               QDir::toNativeSeparators(destAbsolute)),
                       0, destAbsolute);
         return;
     }
@@ -964,6 +1031,37 @@ void ArchiveWorker::testArchive(const QString &archivePath, const QString &passw
 {
     resetCancel();
 
+    const bool isUdf = ExternalEngine::isUdfIso(archivePath);
+    const bool isEncrypted7z =
+        !password.isEmpty()
+        && QFileInfo(archivePath).suffix().compare(QStringLiteral("7z"), Qt::CaseInsensitive) == 0;
+    if (isUdf || (isEncrypted7z && ExternalEngine::available())) {
+        ExternalEngine::ProgressCallback callback;
+        callback.report = [this](int percent, const QString &detail) {
+            emit progress(percent, detail);
+        };
+        QString error;
+        bool canceled = false;
+        emit progress(0, QStringLiteral("正在使用 7-Zip 引擎校验%1…")
+                             .arg(isUdf ? QStringLiteral(" UDF 光盘映像")
+                                        : QStringLiteral("加密 7Z")));
+        if (!ExternalEngine::test(archivePath, password, &error, callback, &m_cancelRequested,
+                                  &canceled)) {
+            if (isEncrypted7z && !canceled
+                && error.contains(QStringLiteral("password"), Qt::CaseInsensitive))
+                emit passwordRequired(Test, archivePath);
+            emit finished(Test, false, canceled, error, 0, archivePath);
+            return;
+        }
+        emit progress(100, QStringLiteral("校验完成"));
+        emit finished(Test, true, false,
+                      QStringLiteral("压缩包测试完成，数据完整（%1，7-Zip 引擎）。")
+                          .arg(isUdf ? QStringLiteral("UDF 光盘映像")
+                                     : QStringLiteral("加密 7Z")),
+                      0, archivePath);
+        return;
+    }
+
     QFile file(archivePath);
     if (!file.open(QIODevice::ReadOnly)) {
         emit finished(Test, false, false,
@@ -1106,16 +1204,38 @@ void ArchiveWorker::compressArchive(const QStringList &sources, const QString &o
                       QStringLiteral("不支持的输出格式：%1").arg(options.format), 0, outputPath);
         return;
     }
-    if (!options.password.isEmpty() && !isZip) {
+    if (!options.password.isEmpty() && !isZip && !is7z) {
         emit finished(Compress, false, false,
-                      QStringLiteral("0.0.2 仅为 ZIP 写入启用密码；%1 压缩包不能设置密码。\n"
-                                     "请选择 ZIP 格式，或清空密码。")
+                      QStringLiteral("TAR 系列不支持密码；%1 压缩包不能设置密码。\n"
+                                     "请选择 ZIP / 7Z 格式，或清空密码。")
                           .arg(label),
                       0, outputPath);
         return;
     }
     if (!options.password.isEmpty() && options.password.size() < 1) {
         emit finished(Compress, false, false, QStringLiteral("密码不能为空。"), 0, outputPath);
+        return;
+    }
+
+    // libarchive 的 7Z 写入器不支持加密；带密码的 7Z 交给 7-Zip 引擎。
+    if (!options.password.isEmpty() && is7z) {
+        ExternalEngine::ProgressCallback callback;
+        callback.report = [this](int percent, const QString &detail) {
+            emit progress(percent, detail);
+        };
+        QString error;
+        bool canceled = false;
+        emit progress(0, QStringLiteral("正在使用 7-Zip 引擎创建加密 7Z…"));
+        if (!ExternalEngine::compress7z(sources, outputPath, options.level, options.password,
+                                        &error, callback, &m_cancelRequested, &canceled)) {
+            emit finished(Compress, false, canceled, error, 0, outputPath);
+            return;
+        }
+        emit progress(100, QStringLiteral("压缩完成"));
+        emit finished(Compress, true, false,
+                      QStringLiteral("7Z 压缩完成，已启用密码（7-Zip 引擎）。\n输出：%1")
+                          .arg(QDir::toNativeSeparators(outputPath)),
+                      0, outputPath);
         return;
     }
 
