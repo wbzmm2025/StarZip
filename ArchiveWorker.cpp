@@ -146,6 +146,21 @@ QString formatNameFromSuffix(const QString &archivePath)
     return QString();
 }
 
+QString formatLabel(const QString &format)
+{
+    if (format == QStringLiteral("zip"))
+        return QStringLiteral("ZIP");
+    if (format == QStringLiteral("7z"))
+        return QStringLiteral("7Z");
+    if (format == QStringLiteral("tar"))
+        return QStringLiteral("TAR");
+    if (format == QStringLiteral("tar.gz"))
+        return QStringLiteral("TAR.GZ");
+    if (format == QStringLiteral("tar.xz"))
+        return QStringLiteral("TAR.XZ");
+    return format.toUpper();
+}
+
 QString archiveErrorMessage(archive *a, const QString &context, int fallbackCode = 0)
 {
     int code = a ? archive_errno(a) : 0;
@@ -162,19 +177,32 @@ QString archiveErrorMessage(archive *a, const QString &context, int fallbackCode
     return message;
 }
 
+bool messageMentionsPassword(archive *a)
+{
+    const char *raw = a ? archive_error_string(a) : nullptr;
+    if (!raw || !*raw)
+        return false;
+    const QString text = QString::fromUtf8(raw).toLower();
+    return text.contains(QStringLiteral("passphrase"))
+           || text.contains(QStringLiteral("password"))
+           || text.contains(QStringLiteral("encrypted"))
+           || text.contains(QStringLiteral("encryption"))
+           || text.contains(QStringLiteral("decrypt"));
+}
+
 QString addFormatHint(const QString &archivePath, const QString &message)
 {
     const QString suffix = QFileInfo(archivePath).suffix().toLower();
     if (suffix == QStringLiteral("rar")) {
         return message
-               + QStringLiteral("\n\n提示：StarZip 0.0.1 通过 libarchive 读取 RAR/RAR5，"
-                                "支持范围受 libarchive 版本限制；加密、分卷、"
-                                "以及使用不支持压缩算法的 RAR 无法解压，且本版本不支持创建 RAR。");
+               + QStringLiteral("\n\n提示：StarZip 通过 libarchive 读取 RAR/RAR5，支持范围受 libarchive "
+                                "版本限制；加密 RAR 可尝试输入密码。分卷、损坏或使用不支持压缩算法的 "
+                                "RAR 无法解压，且本版本不支持创建 RAR。");
     }
     if (suffix == QStringLiteral("7z")) {
         return message
-               + QStringLiteral("\n\n提示：加密 7z 或使用 libarchive 未编译编码器的 7z 无法解压；"
-                                "本版本不提供密码输入。");
+               + QStringLiteral("\n\n提示：加密 7Z 可尝试输入密码；使用 libarchive 未编译编码器的 7Z "
+                                "会明确报错。");
     }
     return message;
 }
@@ -240,12 +268,19 @@ int readCloseCallback(archive *, void *)
     return ARCHIVE_OK;
 }
 
-bool openReader(archive *a, ReadContext &context, QString *error)
+bool openReader(archive *a, ReadContext &context, const QString &password,
+                QString *error, bool *needsPassword)
 {
+    *needsPassword = false;
     archive_read_support_filter_all(a);
     // format_all 已包含 ZIP / 7Z / RAR / RAR5 等所有本构建启用的读取器。
     // 不要再次单独注册：重复注册同名读取器会触发 libarchive 内部的清理路径。
     archive_read_support_format_all(a);
+
+    if (!password.isEmpty()) {
+        const QByteArray utf8 = password.toUtf8();
+        archive_read_add_passphrase(a, utf8.constData());
+    }
 
     archive_read_set_callback_data(a, &context);
     archive_read_set_open_callback(a, readOpenCallback);
@@ -256,6 +291,7 @@ bool openReader(archive *a, ReadContext &context, QString *error)
 
     const int result = archive_read_open1(a);
     if (result != ARCHIVE_OK) {
+        *needsPassword = messageMentionsPassword(a);
         *error = archiveErrorMessage(a, QStringLiteral("无法打开或识别压缩包。"));
         return false;
     }
@@ -306,6 +342,32 @@ bool makeSafeRelativePath(const QString &raw, QString *safePath)
     return true;
 }
 
+QString normalizedArchiveKey(const QString &raw)
+{
+    QString path = raw;
+    path.replace(QLatin1Char('\\'), QLatin1Char('/'));
+    while (path.endsWith(QLatin1Char('/')))
+        path.chop(1);
+    return path;
+}
+
+bool selectionMatches(const QString &rawPath, const QStringList &onlyPaths)
+{
+    if (onlyPaths.isEmpty())
+        return true;
+    const QString path = normalizedArchiveKey(rawPath);
+    for (const QString &selectedRaw : onlyPaths) {
+        const QString selected = normalizedArchiveKey(selectedRaw);
+        if (selected.isEmpty())
+            continue;
+        if (path.compare(selected, pathCaseSensitivity()) == 0)
+            return true;
+        if (path.startsWith(selected + QLatin1Char('/'), pathCaseSensitivity()))
+            return true;
+    }
+    return false;
+}
+
 bool writeAll(QFileDevice &file, const char *data, qint64 size)
 {
     qint64 written = 0;
@@ -318,7 +380,7 @@ bool writeAll(QFileDevice &file, const char *data, qint64 size)
     return true;
 }
 
-// ---------- ZIP 写入回调 ----------
+// ---------- 压缩包写入回调 ----------
 struct WriteContext {
     QFileDevice *device = nullptr;
 };
@@ -333,7 +395,7 @@ la_ssize_t writeCallback(archive *a, void *clientData, const void *buffer, size_
     auto *ctx = static_cast<WriteContext *>(clientData);
     const qint64 n = ctx->device->write(static_cast<const char *>(buffer), qint64(length));
     if (n < 0) {
-        archive_set_error(a, errno, "写入 ZIP 文件失败");
+        archive_set_error(a, errno, "写入压缩包文件失败");
         return -1;
     }
     return static_cast<la_ssize_t>(n);
@@ -343,7 +405,7 @@ int writeCloseCallback(archive *a, void *clientData)
 {
     auto *ctx = static_cast<WriteContext *>(clientData);
     if (!ctx->device->flush()) {
-        archive_set_error(a, errno, "刷新 ZIP 文件失败");
+        archive_set_error(a, errno, "刷新压缩包文件失败");
         return ARCHIVE_FATAL;
     }
     return ARCHIVE_OK;
@@ -395,13 +457,13 @@ QString rootNameFor(const QFileInfo &info)
     return name;
 }
 
-CompressScan scanSources(const QStringList &sources, const QString &zipPath,
+CompressScan scanSources(const QStringList &sources, const QString &outputPath,
                          const std::atomic_bool *cancelRequested)
 {
     CompressScan scan;
     QSet<QString> usedRoots;
     QSet<QString> seenSources;
-    const QString zipAbsolute = QFileInfo(zipPath).absoluteFilePath();
+    const QString outputAbsolute = QFileInfo(outputPath).absoluteFilePath();
 
     for (const QString &source : sources) {
         if (cancelRequested && cancelRequested->load(std::memory_order_relaxed)) {
@@ -420,7 +482,7 @@ CompressScan scanSources(const QStringList &sources, const QString &zipPath,
             return scan;
         }
         if (info.isSymLink()) {
-            scan.error = QStringLiteral("0.0.1 不支持将符号链接作为压缩根目录：%1")
+            scan.error = QStringLiteral("不支持将符号链接作为压缩根目录：%1")
                              .arg(QDir::toNativeSeparators(source));
             return scan;
         }
@@ -428,9 +490,9 @@ CompressScan scanSources(const QStringList &sources, const QString &zipPath,
         const QString rootName = uniqueRootName(rootNameFor(info), &usedRoots);
 
         if (info.isFile()) {
-            if (samePath(absoluteSource, zipAbsolute)) {
-                scan.error = QStringLiteral("输出 ZIP 不能与待压缩文件相同：%1")
-                                 .arg(QDir::toNativeSeparators(zipPath));
+            if (samePath(absoluteSource, outputAbsolute)) {
+                scan.error = QStringLiteral("输出压缩包不能与待压缩文件相同：%1")
+                                 .arg(QDir::toNativeSeparators(outputPath));
                 return scan;
             }
             CompressRecord record;
@@ -459,8 +521,6 @@ CompressScan scanSources(const QStringList &sources, const QString &zipPath,
         const QDir::Filters filters = QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot
                                       | QDir::NoSymLinks | QDir::Hidden;
         QDirIterator it(absoluteSource, filters, QDirIterator::Subdirectories);
-        QElapsedTimer scanTimer;
-        scanTimer.start();
         while (it.hasNext()) {
             if (cancelRequested && cancelRequested->load(std::memory_order_relaxed)) {
                 scan.canceled = true;
@@ -471,7 +531,7 @@ CompressScan scanSources(const QStringList &sources, const QString &zipPath,
 
             if (fileInfo.isSymLink())
                 continue;
-            if (!fileInfo.isDir() && samePath(filePath, zipAbsolute))
+            if (!fileInfo.isDir() && samePath(filePath, outputAbsolute))
                 continue;
 
             QString relative = QDir::fromNativeSeparators(
@@ -491,10 +551,6 @@ CompressScan scanSources(const QStringList &sources, const QString &zipPath,
             if (!record.isDir)
                 scan.totalBytes += record.size;
             scan.records.append(record);
-            if (scanTimer.elapsed() > 100) {
-                scanTimer.restart();
-                // 扫描阶段不占用确定进度，仅反馈工作仍在继续。
-            }
         }
     }
 
@@ -526,7 +582,7 @@ void ArchiveWorker::resetCancel()
     m_cancelRequested.store(false, std::memory_order_relaxed);
 }
 
-void ArchiveWorker::listArchive(const QString &archivePath)
+void ArchiveWorker::listArchive(const QString &archivePath, const QString &password)
 {
     resetCancel();
 
@@ -549,7 +605,10 @@ void ArchiveWorker::listArchive(const QString &archivePath)
     ReadContext readContext;
     readContext.file = &file;
     QString openError;
-    if (!openReader(a.get(), readContext, &openError)) {
+    bool needsPassword = false;
+    if (!openReader(a.get(), readContext, password, &openError, &needsPassword)) {
+        if (needsPassword)
+            emit passwordRequired(List, archivePath);
         emit finished(List, false, false, addFormatHint(archivePath, openError),
                       archive_errno(a.get()), archivePath);
         return;
@@ -595,6 +654,8 @@ void ArchiveWorker::listArchive(const QString &archivePath)
     }
 
     if (!truncated && result != ARCHIVE_EOF) {
+        if (messageMentionsPassword(a.get()))
+            emit passwordRequired(List, archivePath);
         emit finished(List, false, false,
                       addFormatHint(archivePath,
                                     archiveErrorMessage(a.get(),
@@ -623,7 +684,8 @@ void ArchiveWorker::listArchive(const QString &archivePath)
                   0, archivePath);
 }
 
-void ArchiveWorker::extractArchive(const QString &archivePath, const QString &destinationDir)
+void ArchiveWorker::extractArchive(const QString &archivePath, const QString &destinationDir,
+                                   const QString &password, const QStringList &onlyPaths)
 {
     resetCancel();
 
@@ -664,7 +726,10 @@ void ArchiveWorker::extractArchive(const QString &archivePath, const QString &de
     ReadContext readContext;
     readContext.file = &archiveFile;
     QString openError;
-    if (!openReader(a.get(), readContext, &openError)) {
+    bool needsPassword = false;
+    if (!openReader(a.get(), readContext, password, &openError, &needsPassword)) {
+        if (needsPassword)
+            emit passwordRequired(Extract, archivePath);
         emit finished(Extract, false, false, addFormatHint(archivePath, openError),
                       archive_errno(a.get()), destAbsolute);
         return;
@@ -704,6 +769,11 @@ void ArchiveWorker::extractArchive(const QString &archivePath, const QString &de
 
         ++entryCount;
         const QString rawPath = entryPath(entry);
+        if (!selectionMatches(rawPath, onlyPaths)) {
+            archive_read_data_skip(a.get());
+            continue;
+        }
+
         QString relativePath;
         if (!makeSafeRelativePath(rawPath, &relativePath)) {
             ++skippedCount;
@@ -711,10 +781,11 @@ void ArchiveWorker::extractArchive(const QString &archivePath, const QString &de
             continue;
         }
 
-        if (archive_entry_is_encrypted(entry)) {
+        if (archive_entry_is_encrypted(entry) && password.isEmpty()) {
+            emit passwordRequired(Extract, archivePath);
             emit finished(Extract, false, false,
                           addFormatHint(archivePath,
-                                        QStringLiteral("压缩包包含加密条目，0.0.1 不支持加密/密码。\n"
+                                        QStringLiteral("压缩包包含加密条目，请输入密码后重试。\n"
                                                        "条目：%1")
                                             .arg(rawPath)),
                           0, destAbsolute);
@@ -841,11 +912,18 @@ void ArchiveWorker::extractArchive(const QString &archivePath, const QString &de
         if (dataResult != ARCHIVE_EOF) {
             outFile.close();
             outFile.remove();
+            const bool passwordIssue = messageMentionsPassword(a.get());
+            if (passwordIssue)
+                emit passwordRequired(Extract, archivePath);
             emit finished(Extract, false, false,
                           addFormatHint(archivePath,
                                         archiveErrorMessage(a.get(),
-                                                            QStringLiteral("读取条目数据失败：%1")
-                                                                .arg(relativePath))),
+                                                            passwordIssue
+                                                                ? QStringLiteral("密码不正确，无法"
+                                                                                 "读取条目：%1")
+                                                                      .arg(relativePath)
+                                                                : QStringLiteral("读取条目数据失败：%1")
+                                                                      .arg(relativePath))),
                           archive_errno(a.get()), destAbsolute);
             return;
         }
@@ -855,6 +933,9 @@ void ArchiveWorker::extractArchive(const QString &archivePath, const QString &de
     }
 
     if (result != ARCHIVE_EOF) {
+        const bool passwordIssue = messageMentionsPassword(a.get());
+        if (passwordIssue)
+            emit passwordRequired(Extract, archivePath);
         emit finished(Extract, false, false,
                       addFormatHint(archivePath,
                                     archiveErrorMessage(a.get(),
@@ -869,58 +950,211 @@ void ArchiveWorker::extractArchive(const QString &archivePath, const QString &de
                           .arg(fileCount)
                           .arg(skippedCount)
                           .arg(QDir::toNativeSeparators(destAbsolute));
+    if (onlyPaths.isEmpty())
+        message += QStringLiteral("\n范围：全部条目");
+    else
+        message += QStringLiteral("\n范围：选中的 %1 项").arg(onlyPaths.size());
     if (skippedCount > 0) {
         message += QStringLiteral("\n\n注意：已跳过符号链接、特殊文件或路径不安全的条目。");
     }
     emit finished(Extract, true, false, message, 0, destAbsolute);
 }
 
-void ArchiveWorker::compressToZip(const QStringList &sources, const QString &zipPath)
+void ArchiveWorker::testArchive(const QString &archivePath, const QString &password)
+{
+    resetCancel();
+
+    QFile file(archivePath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        emit finished(Test, false, false,
+                      QStringLiteral("无法读取压缩包：%1\n%2")
+                          .arg(QDir::toNativeSeparators(archivePath), file.errorString()),
+                      0, archivePath);
+        return;
+    }
+
+    ArchiveReadPtr a(archive_read_new());
+    if (!a) {
+        emit finished(Test, false, false, QStringLiteral("无法创建 libarchive 读取器（内存不足）。"),
+                      ENOMEM, archivePath);
+        return;
+    }
+
+    ReadContext readContext;
+    readContext.file = &file;
+    QString openError;
+    bool needsPassword = false;
+    if (!openReader(a.get(), readContext, password, &openError, &needsPassword)) {
+        if (needsPassword)
+            emit passwordRequired(Test, archivePath);
+        emit finished(Test, false, false, addFormatHint(archivePath, openError),
+                      archive_errno(a.get()), archivePath);
+        return;
+    }
+
+    const qint64 archiveSize = file.size();
+    QElapsedTimer timer;
+    timer.start();
+    int entryCount = 0;
+    int fileCount = 0;
+    qint64 totalBytes = 0;
+    int result = ARCHIVE_OK;
+    archive_entry *entry = nullptr;
+
+    emit progress(0, QStringLiteral("正在校验压缩包…"));
+
+    while ((result = archive_read_next_header(a.get(), &entry)) == ARCHIVE_OK
+           || result == ARCHIVE_WARN) {
+        if (isCancelRequested()) {
+            emit finished(Test, false, true, QStringLiteral("测试操作已取消。"), 0, archivePath);
+            return;
+        }
+        ++entryCount;
+
+        if (archive_entry_is_encrypted(entry) && password.isEmpty()) {
+            emit passwordRequired(Test, archivePath);
+            emit finished(Test, false, false,
+                          addFormatHint(archivePath,
+                                        QStringLiteral("压缩包包含加密条目，请输入密码后重试。\n"
+                                                       "条目：%1")
+                                            .arg(entryPath(entry))),
+                          0, archivePath);
+            return;
+        }
+
+        if (archive_entry_filetype(entry) == AE_IFDIR)
+            continue;
+
+        const void *block = nullptr;
+        size_t blockSize = 0;
+        la_int64_t blockOffset = 0;
+        int dataResult = ARCHIVE_OK;
+        while ((dataResult = archive_read_data_block(a.get(), &block, &blockSize, &blockOffset))
+               == ARCHIVE_OK) {
+            if (isCancelRequested()) {
+                emit finished(Test, false, true, QStringLiteral("测试操作已取消。"), 0,
+                              archivePath);
+                return;
+            }
+            totalBytes += static_cast<qint64>(blockSize);
+        }
+        if (dataResult != ARCHIVE_EOF) {
+            const bool passwordIssue = messageMentionsPassword(a.get());
+            if (passwordIssue)
+                emit passwordRequired(Test, archivePath);
+            emit finished(Test, false, false,
+                          addFormatHint(archivePath,
+                                        archiveErrorMessage(a.get(),
+                                                            QStringLiteral("测试失败：%1")
+                                                                .arg(entryPath(entry)))),
+                          archive_errno(a.get()), archivePath);
+            return;
+        }
+        ++fileCount;
+        if (timer.elapsed() > 80 || fileCount == 1) {
+            timer.restart();
+            const int percent = archiveSize > 0
+                                    ? static_cast<int>(qMin<qint64>(99,
+                                                                    file.pos() * 100 / archiveSize))
+                                    : 50;
+            emit progress(percent, QStringLiteral("正在校验：%1").arg(entryPath(entry)));
+        }
+    }
+
+    if (result != ARCHIVE_EOF) {
+        const bool passwordIssue = messageMentionsPassword(a.get());
+        if (passwordIssue)
+            emit passwordRequired(Test, archivePath);
+        emit finished(Test, false, false,
+                      addFormatHint(archivePath,
+                                    archiveErrorMessage(a.get(),
+                                                        QStringLiteral("测试过程中读取压缩包失败。"))),
+                      archive_errno(a.get()), archivePath);
+        return;
+    }
+
+    emit progress(100, QStringLiteral("校验完成"));
+    emit finished(Test, true, false,
+                  QStringLiteral("压缩包测试完成，数据完整。\n条目：%1，文件：%2，解压后大小：%3")
+                      .arg(entryCount)
+                      .arg(fileCount)
+                      .arg(totalBytes),
+                  0, archivePath);
+}
+
+void ArchiveWorker::compressArchive(const QStringList &sources, const QString &outputPath,
+                                    const CompressOptions &options)
 {
     resetCancel();
 
     if (sources.isEmpty()) {
         emit finished(Compress, false, false, QStringLiteral("没有选择要压缩的文件或文件夹。"), 0,
-                      zipPath);
+                      outputPath);
+        return;
+    }
+
+    const QString format = options.format.toLower();
+    const QString label = formatLabel(format);
+    const bool isZip = format == QStringLiteral("zip");
+    const bool is7z = format == QStringLiteral("7z");
+    const bool isTar = format == QStringLiteral("tar");
+    const bool isTarGz = format == QStringLiteral("tar.gz");
+    const bool isTarXz = format == QStringLiteral("tar.xz");
+
+    if (!isZip && !is7z && !isTar && !isTarGz && !isTarXz) {
+        emit finished(Compress, false, false,
+                      QStringLiteral("不支持的输出格式：%1").arg(options.format), 0, outputPath);
+        return;
+    }
+    if (!options.password.isEmpty() && !isZip) {
+        emit finished(Compress, false, false,
+                      QStringLiteral("0.0.2 仅为 ZIP 写入启用密码；%1 压缩包不能设置密码。\n"
+                                     "请选择 ZIP 格式，或清空密码。")
+                          .arg(label),
+                      0, outputPath);
+        return;
+    }
+    if (!options.password.isEmpty() && options.password.size() < 1) {
+        emit finished(Compress, false, false, QStringLiteral("密码不能为空。"), 0, outputPath);
         return;
     }
 
     emit progress(0, QStringLiteral("正在扫描待压缩内容…"));
-    const CompressScan scan = scanSources(sources, zipPath, &m_cancelRequested);
+    const CompressScan scan = scanSources(sources, outputPath, &m_cancelRequested);
     if (scan.canceled) {
-        emit finished(Compress, false, true, QStringLiteral("压缩操作已取消。"), 0, zipPath);
+        emit finished(Compress, false, true, QStringLiteral("压缩操作已取消。"), 0, outputPath);
         return;
     }
     if (!scan.error.isEmpty()) {
-        emit finished(Compress, false, false, scan.error, scan.errorCode, zipPath);
+        emit finished(Compress, false, false, scan.error, scan.errorCode, outputPath);
         return;
     }
     if (isCancelRequested()) {
-        emit finished(Compress, false, true, QStringLiteral("压缩操作已取消。"), 0, zipPath);
+        emit finished(Compress, false, true, QStringLiteral("压缩操作已取消。"), 0, outputPath);
         return;
     }
 
-    if (QFileInfo(zipPath).exists() && QFileInfo(zipPath).isDir()) {
+    if (QFileInfo(outputPath).exists() && QFileInfo(outputPath).isDir()) {
         emit finished(Compress, false, false,
-                      QStringLiteral("输出路径是文件夹，无法保存 ZIP：%1")
-                          .arg(QDir::toNativeSeparators(zipPath)),
-                      0, zipPath);
+                      QStringLiteral("输出路径是文件夹，无法保存压缩包：%1")
+                          .arg(QDir::toNativeSeparators(outputPath)),
+                      0, outputPath);
         return;
     }
-    if (!QDir().mkpath(QFileInfo(zipPath).absolutePath())) {
+    if (!QDir().mkpath(QFileInfo(outputPath).absolutePath())) {
         emit finished(Compress, false, false,
-                      QStringLiteral("无法创建 ZIP 输出目录：%1")
-                          .arg(QDir::toNativeSeparators(QFileInfo(zipPath).absolutePath())),
-                      0, zipPath);
+                      QStringLiteral("无法创建输出目录：%1")
+                          .arg(QDir::toNativeSeparators(QFileInfo(outputPath).absolutePath())),
+                      0, outputPath);
         return;
     }
 
-    QSaveFile outFile(zipPath);
+    QSaveFile outFile(outputPath);
     if (!outFile.open(QIODevice::WriteOnly)) {
         emit finished(Compress, false, false,
-                      QStringLiteral("无法创建 ZIP 文件：%1\n%2")
-                          .arg(QDir::toNativeSeparators(zipPath), outFile.errorString()),
-                      0, zipPath);
+                      QStringLiteral("无法创建压缩包：%1\n%2")
+                          .arg(QDir::toNativeSeparators(outputPath), outFile.errorString()),
+                      0, outputPath);
         return;
     }
 
@@ -929,35 +1163,102 @@ void ArchiveWorker::compressToZip(const QStringList &sources, const QString &zip
         outFile.cancelWriting();
         emit finished(Compress, false, false,
                       QStringLiteral("无法创建 libarchive 写入器（内存不足）。"),
-                      ENOMEM, zipPath);
+                      ENOMEM, outputPath);
         return;
     }
+    // 自定义回调写入时 libarchive 默认会补零到 10 KiB 块；7Z 读取器会把尾部填充
+    // 判定为损坏，因此要求最后一块按实际字节数写出。
+    archive_write_set_bytes_in_last_block(a.get(), 1);
 
     auto abortCompression = [&](const QString &message, int errorCode) {
         if (a)
             a.reset();
         outFile.cancelWriting();
-        emit finished(Compress, false, false, message, errorCode, zipPath);
+        emit finished(Compress, false, false, message, errorCode, outputPath);
     };
 
-    int result = archive_write_set_format_zip(a.get());
-    if (result != ARCHIVE_OK) {
-        abortCompression(archiveErrorMessage(a.get(), QStringLiteral("无法初始化 ZIP 写入器。")),
-                         archive_errno(a.get()));
-        return;
+    const QByteArray levelText = QByteArray::number(qBound(0, options.level, 9));
+    int result = ARCHIVE_OK;
+    bool zipCryptoFallback = false;
+
+    if (isZip) {
+        result = archive_write_set_format_zip(a.get());
+        if (result != ARCHIVE_OK) {
+            abortCompression(archiveErrorMessage(a.get(), QStringLiteral("无法初始化 ZIP 写入器。")),
+                             archive_errno(a.get()));
+            return;
+        }
+        archive_write_set_format_option(a.get(), "zip", "hdrcharset", "UTF-8");
+        archive_write_set_format_option(a.get(), "zip", "compression",
+                                        options.level <= 0 ? "store" : "deflate");
+        archive_write_set_format_option(a.get(), "zip", "compression-level", levelText.constData());
+        archive_write_set_format_option(a.get(), "zip", "zip64", "1");
+
+        if (!options.password.isEmpty()) {
+            int enc = archive_write_set_format_option(a.get(), "zip", "encryption", "aes256");
+            if (enc != ARCHIVE_OK) {
+                enc = archive_write_set_format_option(a.get(), "zip", "encryption", "zipcrypt");
+                zipCryptoFallback = true;
+            }
+            if (enc != ARCHIVE_OK) {
+                abortCompression(archiveErrorMessage(a.get(),
+                                                     QStringLiteral("当前 libarchive 不支持 ZIP "
+                                                                    "加密。")),
+                                 archive_errno(a.get()));
+                return;
+            }
+            const QByteArray passwordUtf8 = options.password.toUtf8();
+            if (archive_write_set_passphrase(a.get(), passwordUtf8.constData()) != ARCHIVE_OK) {
+                abortCompression(archiveErrorMessage(a.get(),
+                                                     QStringLiteral("设置 ZIP 密码失败。")),
+                                 archive_errno(a.get()));
+                return;
+            }
+        }
+    } else if (is7z) {
+        result = archive_write_set_format_7zip(a.get());
+        if (result != ARCHIVE_OK) {
+            abortCompression(archiveErrorMessage(a.get(), QStringLiteral("无法初始化 7Z 写入器。")),
+                             archive_errno(a.get()));
+            return;
+        }
+        archive_write_set_format_option(a.get(), "7zip", "compression-level", levelText.constData());
+    } else {
+        result = archive_write_set_format_pax_restricted(a.get());
+        if (result != ARCHIVE_OK) {
+            abortCompression(archiveErrorMessage(a.get(), QStringLiteral("无法初始化 TAR 写入器。")),
+                             archive_errno(a.get()));
+            return;
+        }
+        if (isTarGz) {
+            result = archive_write_add_filter_gzip(a.get());
+            if (result != ARCHIVE_OK) {
+                abortCompression(archiveErrorMessage(a.get(),
+                                                     QStringLiteral("无法初始化 gzip 过滤器。")),
+                                 archive_errno(a.get()));
+                return;
+            }
+            archive_write_set_filter_option(a.get(), "gzip", "compression-level",
+                                            levelText.constData());
+        } else if (isTarXz) {
+            result = archive_write_add_filter_xz(a.get());
+            if (result != ARCHIVE_OK) {
+                abortCompression(archiveErrorMessage(a.get(),
+                                                     QStringLiteral("无法初始化 xz 过滤器。")),
+                                 archive_errno(a.get()));
+                return;
+            }
+            archive_write_set_filter_option(a.get(), "xz", "compression-level",
+                                            levelText.constData());
+        }
     }
-    archive_write_add_filter_none(a.get());
-    archive_write_set_format_option(a.get(), "zip", "hdrcharset", "UTF-8");
-    archive_write_set_format_option(a.get(), "zip", "compression", "deflate");
-    archive_write_set_format_option(a.get(), "zip", "compression-level", "6");
-    archive_write_set_format_option(a.get(), "zip", "zip64", "1");
 
     WriteContext writeContext;
     writeContext.device = &outFile;
     result = archive_write_open(a.get(), &writeContext, writeOpenCallback, writeCallback,
                                 writeCloseCallback);
     if (result != ARCHIVE_OK) {
-        abortCompression(archiveErrorMessage(a.get(), QStringLiteral("无法打开 ZIP 输出流。")),
+        abortCompression(archiveErrorMessage(a.get(), QStringLiteral("无法打开输出流。")),
                          archive_errno(a.get()));
         return;
     }
@@ -984,7 +1285,7 @@ void ArchiveWorker::compressToZip(const QStringList &sources, const QString &zip
         if (isCancelRequested()) {
             a.reset();
             outFile.cancelWriting();
-            emit finished(Compress, false, true, QStringLiteral("压缩操作已取消。"), 0, zipPath);
+            emit finished(Compress, false, true, QStringLiteral("压缩操作已取消。"), 0, outputPath);
             return;
         }
 
@@ -995,8 +1296,7 @@ void ArchiveWorker::compressToZip(const QStringList &sources, const QString &zip
 
         ArchiveEntryPtr entry(archive_entry_new());
         if (!entry) {
-            abortCompression(QStringLiteral("无法创建压缩条目（内存不足）。"),
-                             ENOMEM);
+            abortCompression(QStringLiteral("无法创建压缩条目（内存不足）。"), ENOMEM);
             return;
         }
         archive_entry_set_pathname_utf8(entry.get(), archiveNameUtf8.constData());
@@ -1008,8 +1308,8 @@ void ArchiveWorker::compressToZip(const QStringList &sources, const QString &zip
         result = archive_write_header(a.get(), entry.get());
         if (result < ARCHIVE_WARN) {
             abortCompression(archiveErrorMessage(a.get(),
-                                                 QStringLiteral("写入 ZIP 条目头失败：%1")
-                                                     .arg(record.archivePath)),
+                                                 QStringLiteral("写入 %1 条目头失败：%2")
+                                                     .arg(label, record.archivePath)),
                              archive_errno(a.get()));
             return;
         }
@@ -1031,7 +1331,7 @@ void ArchiveWorker::compressToZip(const QStringList &sources, const QString &zip
                     a.reset();
                     outFile.cancelWriting();
                     emit finished(Compress, false, true, QStringLiteral("压缩操作已取消。"), 0,
-                                  zipPath);
+                                  outputPath);
                     return;
                 }
                 const qint64 wanted = qMin<qint64>(qint64(buffer.size()), remaining);
@@ -1056,13 +1356,13 @@ void ArchiveWorker::compressToZip(const QStringList &sources, const QString &zip
                         static_cast<size_t>(got - dataOffset));
                     if (written < 0) {
                         abortCompression(archiveErrorMessage(a.get(),
-                                                             QStringLiteral("写入 ZIP 数据失败：%1")
-                                                                 .arg(record.archivePath)),
+                                                             QStringLiteral("写入 %1 数据失败：%2")
+                                                                 .arg(label, record.archivePath)),
                                          archive_errno(a.get()));
                         return;
                     }
                     if (written == 0) {
-                        abortCompression(QStringLiteral("ZIP 写入器没有接受数据：%1")
+                        abortCompression(QStringLiteral("压缩写入器没有接受数据：%1")
                                              .arg(record.archivePath),
                                          0);
                         return;
@@ -1076,7 +1376,7 @@ void ArchiveWorker::compressToZip(const QStringList &sources, const QString &zip
                                               99, bytesDone * 100 / scan.totalBytes))
                                         : static_cast<int>(
                                               qMin<qint64>(99, qint64(recordsDone + 1) * 100
-                                                                   / scan.records.size()));
+                                                                    / scan.records.size()));
                 reportProgress(percent,
                                QStringLiteral("正在压缩：%1").arg(record.archivePath), false);
             }
@@ -1086,8 +1386,8 @@ void ArchiveWorker::compressToZip(const QStringList &sources, const QString &zip
         result = archive_write_finish_entry(a.get());
         if (result < ARCHIVE_WARN) {
             abortCompression(archiveErrorMessage(a.get(),
-                                                 QStringLiteral("完成 ZIP 条目失败：%1")
-                                                     .arg(record.archivePath)),
+                                                 QStringLiteral("完成 %1 条目失败：%2")
+                                                     .arg(label, record.archivePath)),
                              archive_errno(a.get()));
             return;
         }
@@ -1096,27 +1396,33 @@ void ArchiveWorker::compressToZip(const QStringList &sources, const QString &zip
 
     result = archive_write_close(a.get());
     if (result != ARCHIVE_OK) {
-        const QString error = archiveErrorMessage(a.get(), QStringLiteral("关闭 ZIP 压缩包失败。"));
+        const QString error = archiveErrorMessage(a.get(),
+                                                  QStringLiteral("关闭 %1 压缩包失败。").arg(label));
         const int code = archive_errno(a.get());
         a.reset();
         outFile.cancelWriting();
-        emit finished(Compress, false, false, error, code, zipPath);
+        emit finished(Compress, false, false, error, code, outputPath);
         return;
     }
     a.reset();
 
     if (!outFile.commit()) {
         emit finished(Compress, false, false,
-                      QStringLiteral("保存 ZIP 文件失败：%1\n%2")
-                          .arg(QDir::toNativeSeparators(zipPath), outFile.errorString()),
-                      0, zipPath);
+                      QStringLiteral("保存压缩包失败：%1\n%2")
+                          .arg(QDir::toNativeSeparators(outputPath), outFile.errorString()),
+                      0, outputPath);
         return;
     }
 
     emit progress(100, QStringLiteral("压缩完成"));
-    emit finished(Compress, true, false,
-                  QStringLiteral("ZIP 压缩完成。\n条目：%1\n输出文件：%2")
-                      .arg(scan.records.size())
-                      .arg(QDir::toNativeSeparators(zipPath)),
-                  0, zipPath);
+    QString message = QStringLiteral("%1 压缩完成。\n条目：%2\n输出文件：%3")
+                          .arg(label)
+                          .arg(scan.records.size())
+                          .arg(QDir::toNativeSeparators(outputPath));
+    if (!options.password.isEmpty()) {
+        message += QStringLiteral("\n加密：已启用（%1）")
+                       .arg(zipCryptoFallback ? QStringLiteral("ZipCrypto（兼容模式）")
+                                              : QStringLiteral("AES-256"));
+    }
+    emit finished(Compress, true, false, message, 0, outputPath);
 }

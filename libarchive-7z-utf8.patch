@@ -1,0 +1,89 @@
+diff --git a/libarchive/archive_write_set_format_7zip.c b/libarchive/archive_write_set_format_7zip.c
+index c0603cb..3fcc489 100644
+--- a/libarchive/archive_write_set_format_7zip.c
++++ b/libarchive/archive_write_set_format_7zip.c
+@@ -1634,6 +1634,7 @@ file_new(struct archive_write *a, struct archive_entry *entry,
+ 	struct file *file;
+ 	const char *u16;
+ 	size_t u16len;
++	char *u16_alloc = NULL;
+ 	int ret = ARCHIVE_OK;
+ 
+ 	zip = (struct _7zip *)a->format_data;
+@@ -1646,18 +1647,51 @@ file_new(struct archive_write *a, struct archive_entry *entry,
+ 		return (ARCHIVE_FATAL);
+ 	}
+ 
+-	if (0 > archive_entry_pathname_l(entry, &u16, &u16len, zip->sconv)) {
+-		if (errno == ENOMEM) {
+-			free(file);
+-			archive_set_error(&a->archive, ENOMEM,
+-			    "Can't allocate memory for UTF-16LE");
+-			return (ARCHIVE_FATAL);
++#if defined(_WIN32) && !defined(__CYGWIN__)
++	/*
++	 * StarZip patch: convert directly from UTF-8 to UTF-16LE.
++	 *
++	 * libarchive's generic path converts through the current locale, which
++	 * cannot be UTF-8 on Windows.  For non-ASCII names the conversion then
++	 * silently produces empty strings and corrupts the 7-Zip header (which
++	 * other tools still tolerate, while libarchive's own reader rejects it
++	 * as a damaged archive).
++	 */
++	{
++		const char *u8 = archive_entry_pathname_utf8(entry);
++		if (u8 != NULL) {
++			int wlen = MultiByteToWideChar(CP_UTF8, 0, u8, -1, NULL, 0);
++			if (wlen > 0) {
++				wchar_t *wbuf = malloc(sizeof(wchar_t) * (size_t)wlen);
++				if (wbuf == NULL) {
++					free(file);
++					archive_set_error(&a->archive, ENOMEM,
++					    "Can't allocate memory for UTF-16LE");
++					return (ARCHIVE_FATAL);
++				}
++				if (MultiByteToWideChar(CP_UTF8, 0, u8, -1, wbuf,
++				    wlen) == wlen) {
++					size_t n = (size_t)(wlen - 1) * sizeof(wchar_t);
++					u16_alloc = malloc(n + 2);
++					if (u16_alloc == NULL) {
++						free(wbuf);
++						free(file);
++						archive_set_error(&a->archive, ENOMEM,
++						    "Can't allocate memory for UTF-16LE");
++						return (ARCHIVE_FATAL);
++					}
++					memcpy(u16_alloc, wbuf, n);
++					u16_alloc[n] = 0;
++					u16_alloc[n + 1] = 0;
++					u16 = u16_alloc;
++					u16len = n;
++				}
++				free(wbuf);
++			}
+ 		}
+-		archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
+-		    "A filename cannot be converted to UTF-16LE;"
+-		    "You should disable making Joliet extension");
+-		ret = ARCHIVE_WARN;
+ 	}
++	if (u16_alloc == NULL)
++#endif
+ 	{
+ 		if (0 > archive_entry_pathname_l(entry, &u16, &u16len, zip->sconv)) {
+ 			if (errno == ENOMEM) {
+@@ -1674,12 +1708,14 @@ file_new(struct archive_write *a, struct archive_entry *entry,
+ 	}
+ 	file->utf16name = malloc(u16len + 2);
+ 	if (file->utf16name == NULL) {
++		free(u16_alloc);
+ 		free(file);
+ 		archive_set_error(&a->archive, ENOMEM,
+ 		    "Can't allocate memory for Name");
+ 		return (ARCHIVE_FATAL);
+ 	}
+ 	memcpy(file->utf16name, u16, u16len);
++	free(u16_alloc);
+ 	file->utf16name[u16len+0] = 0;
+ 	file->utf16name[u16len+1] = 0;
+ 	file->name_len = (unsigned)u16len;

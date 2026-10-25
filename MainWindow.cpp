@@ -1,48 +1,86 @@
 #include "MainWindow.h"
 
 #include <QAbstractItemView>
+#include <QAction>
 #include <QApplication>
 #include <QBrush>
+#include <QCheckBox>
+#include <QClipboard>
 #include <QCloseEvent>
-#include <QColor>
+#include <QComboBox>
 #include <QDateTime>
+#include <QDesktopServices>
 #include <QDir>
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFrame>
+#include <QGridLayout>
+#include <QGroupBox>
 #include <QHBoxLayout>
+#include <QHash>
 #include <QHeaderView>
+#include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMenu>
+#include <QMenuBar>
 #include <QMessageBox>
 #include <QMimeData>
+#include <QPainter>
 #include <QPlainTextEdit>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QSettings>
+#include <QStackedWidget>
 #include <QStatusBar>
 #include <QStyle>
 #include <QTabWidget>
 #include <QThread>
+#include <QToolBar>
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
 #include <QUrl>
 #include <QVBoxLayout>
 
 #include <algorithm>
+#include <functional>
 
 namespace {
 
-bool urlIsLocalFile(const QUrl &url)
+bool urlIsLocalPath(const QUrl &url)
 {
-    return url.isLocalFile() && QFileInfo(url.toLocalFile()).isFile();
+    if (!url.isLocalFile())
+        return false;
+    const QFileInfo info(url.toLocalFile());
+    return info.exists() && (info.isFile() || info.isDir());
 }
 
-QString archiveDisplayName(const QString &path)
+QIcon makeAppIcon()
 {
-    const QFileInfo info(path);
-    return info.fileName().isEmpty() ? path : info.fileName();
+    QPixmap pixmap(64, 64);
+    pixmap.fill(Qt::transparent);
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+
+    QLinearGradient gradient(0, 0, 64, 64);
+    gradient.setColorAt(0.0, QColor(QStringLiteral("#2f6fed")));
+    gradient.setColorAt(1.0, QColor(QStringLiteral("#1d3fa8")));
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(gradient);
+    painter.drawRoundedRect(QRectF(5, 5, 54, 54), 12, 12);
+
+    painter.setPen(QPen(QColor(255, 255, 255, 235), 3.2, Qt::SolidLine, Qt::RoundCap));
+    painter.drawLine(QPointF(25, 15), QPointF(25, 49));
+    painter.drawLine(QPointF(39, 15), QPointF(39, 49));
+    for (int y = 17; y <= 45; y += 8) {
+        painter.drawLine(QPointF(25, y), QPointF(32, y));
+        painter.drawLine(QPointF(32, y + 3), QPointF(39, y + 3));
+    }
+    painter.setPen(QPen(QColor(255, 255, 255, 235), 2.4, Qt::SolidLine, Qt::RoundCap));
+    painter.drawArc(QRectF(27, 24, 10, 16), 0, 180 * 16);
+    return QIcon(pixmap);
 }
 
 } // namespace
@@ -55,14 +93,22 @@ MainWindow::MainWindow(QWidget *parent)
 
     setupUi();
 
+    QSettings settings;
+    const QByteArray geometry = settings.value(QStringLiteral("windowGeometry")).toByteArray();
+    if (!geometry.isEmpty())
+        restoreGeometry(geometry);
+
     m_extractTarget = QDir::currentPath();
     m_targetEdit->setText(QDir::toNativeSeparators(m_extractTarget));
     m_targetEdit->setToolTip(QStringLiteral("默认解压到 StarZip 启动时的当前目录：%1")
                                  .arg(QDir::toNativeSeparators(m_extractTarget)));
 
-    appendLog(QStringLiteral("StarZip 0.0.1 已启动。"));
-    appendLog(QStringLiteral("支持通过 libarchive 识别/解压 ZIP、7Z、RAR 等格式；压缩输出为 ZIP。"));
-    statusBar()->showMessage(QStringLiteral("就绪 — 拖入 ZIP / 7Z / RAR 压缩包，或点击“选择文件…”"));
+    appendLog(QStringLiteral("StarZip 0.0.2 已启动。"));
+    appendLog(QStringLiteral("读取：ZIP / 7Z / RAR / RAR5 / TAR / GZ / XZ / CAB / ISO；"
+                             "创建：ZIP / 7Z / TAR / TAR.GZ / TAR.XZ。"));
+    appendLog(QStringLiteral("密码：ZIP 支持 AES-256 写入；加密 ZIP / 7Z / RAR 可输入密码解压。"));
+    rebuildRecentMenu();
+    statusBar()->showMessage(QStringLiteral("就绪 — 拖入压缩包，或点击“打开压缩包…”"));
     updateActions();
 }
 
@@ -78,260 +124,671 @@ MainWindow::~MainWindow()
 
 void MainWindow::setupUi()
 {
-    setWindowTitle(QStringLiteral("StarZip 0.0.1"));
-    resize(980, 720);
-    setMinimumSize(820, 600);
+    setWindowTitle(QStringLiteral("StarZip 0.0.2"));
+    setWindowIcon(makeAppIcon());
+    resize(1120, 780);
+    setMinimumSize(920, 640);
     setAcceptDrops(true);
 
+    setupActions();
+    setupMenus();
+    setupToolBar();
+
     auto *central = new QWidget(this);
+    central->setObjectName(QStringLiteral("appRoot"));
     auto *rootLayout = new QVBoxLayout(central);
-    rootLayout->setContentsMargins(16, 14, 16, 12);
-    rootLayout->setSpacing(10);
+    rootLayout->setContentsMargins(10, 8, 10, 8);
+    rootLayout->setSpacing(8);
 
-    // 顶部拖拽区
-    m_dropZone = new QFrame(central);
-    m_dropZone->setObjectName(QStringLiteral("dropZone"));
-    m_dropZone->setProperty("dragActive", false);
-    m_dropZone->setMinimumHeight(126);
-    auto *dropLayout = new QVBoxLayout(m_dropZone);
-    dropLayout->setContentsMargins(22, 18, 22, 18);
-    dropLayout->setSpacing(6);
-    m_dropTitle = new QLabel(QStringLiteral("把 ZIP / 7Z / RAR 压缩包拖到这里"), m_dropZone);
-    m_dropTitle->setObjectName(QStringLiteral("dropTitle"));
-    m_dropTitle->setAlignment(Qt::AlignCenter);
-    m_dropHint = new QLabel(
-        QStringLiteral("自动识别格式 · 仅接受本地文件 · 解压与压缩均在后台线程执行"), m_dropZone);
-    m_dropHint->setObjectName(QStringLiteral("dropHint"));
-    m_dropHint->setAlignment(Qt::AlignCenter);
-    dropLayout->addStretch(1);
-    dropLayout->addWidget(m_dropTitle);
-    dropLayout->addWidget(m_dropHint);
-    dropLayout->addStretch(1);
-    rootLayout->addWidget(m_dropZone);
+    // 路径卡片：打开压缩包 + 解压目标
+    auto *pathCard = new QFrame(central);
+    pathCard->setObjectName(QStringLiteral("pathCard"));
+    auto *pathLayout = new QVBoxLayout(pathCard);
+    pathLayout->setContentsMargins(12, 9, 12, 9);
+    pathLayout->setSpacing(7);
 
-    // 当前压缩包信息
     auto *archiveRow = new QHBoxLayout();
     archiveRow->setSpacing(8);
-    auto *archiveCaption = new QLabel(QStringLiteral("当前压缩包："), central);
-    m_archiveLabel = new QLabel(QStringLiteral("未选择"), central);
+    auto *archiveCaption = new QLabel(QStringLiteral("压缩包"), pathCard);
+    archiveCaption->setObjectName(QStringLiteral("fieldLabel"));
+    archiveCaption->setMinimumWidth(48);
+    m_archiveLabel = new QLabel(QStringLiteral("未选择"), pathCard);
+    m_archiveLabel->setObjectName(QStringLiteral("archivePathLabel"));
     m_archiveLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     m_archiveLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    m_archiveLabel->setToolTip(QStringLiteral("当前打开的压缩包"));
+    m_openButton = new QPushButton(QStringLiteral("打开…"), pathCard);
+    m_openButton->setToolTip(QStringLiteral("从本地选择 ZIP / 7Z / RAR 等压缩包"));
     archiveRow->addWidget(archiveCaption);
     archiveRow->addWidget(m_archiveLabel, 1);
-    rootLayout->addLayout(archiveRow);
+    archiveRow->addWidget(m_openButton);
+    pathLayout->addLayout(archiveRow);
 
-    // 解压目标目录
     auto *targetRow = new QHBoxLayout();
     targetRow->setSpacing(8);
-    m_targetLabel = new QLabel(QStringLiteral("解压目标："), central);
-    m_targetEdit = new QLineEdit(central);
+    m_targetLabel = new QLabel(QStringLiteral("解压到"), pathCard);
+    m_targetLabel->setObjectName(QStringLiteral("fieldLabel"));
+    m_targetLabel->setMinimumWidth(48);
+    m_targetEdit = new QLineEdit(pathCard);
     m_targetEdit->setPlaceholderText(QStringLiteral("默认当前目录，可直接编辑或浏览选择"));
     m_targetEdit->setClearButtonEnabled(true);
-    m_browseTargetButton = new QPushButton(QStringLiteral("浏览…"), central);
+    m_browseTargetButton = new QPushButton(QStringLiteral("浏览…"), pathCard);
+    m_extractHereButton = new QPushButton(QStringLiteral("解压到此处"), pathCard);
+    m_extractHereButton->setObjectName(QStringLiteral("primaryButton"));
+    m_extractHereButton->setToolTip(QStringLiteral("一键解压全部条目到上方目标目录"));
+    m_extractToButton = new QPushButton(QStringLiteral("解压到…"), pathCard);
+    m_extractToButton->setToolTip(QStringLiteral("选择目标目录并立即解压全部条目"));
     targetRow->addWidget(m_targetLabel);
     targetRow->addWidget(m_targetEdit, 1);
     targetRow->addWidget(m_browseTargetButton);
-    rootLayout->addLayout(targetRow);
+    targetRow->addWidget(m_extractHereButton);
+    targetRow->addWidget(m_extractToButton);
+    pathLayout->addLayout(targetRow);
+    rootLayout->addWidget(pathCard);
 
-    // 高频操作
-    auto *actionRow = new QHBoxLayout();
-    actionRow->setSpacing(8);
-    m_selectButton = new QPushButton(QStringLiteral("选择文件…"), central);
-    m_selectButton->setObjectName(QStringLiteral("primaryButton"));
-    m_selectButton->setToolTip(QStringLiteral("打开 ZIP / 7Z / RAR 等压缩包"));
-    m_extractHereButton = new QPushButton(QStringLiteral("解压到此处"), central);
-    m_extractHereButton->setObjectName(QStringLiteral("primaryButton"));
-    m_extractHereButton->setToolTip(QStringLiteral("一键解压到上方目标目录"));
-    m_extractToButton = new QPushButton(QStringLiteral("解压到…"), central);
-    m_extractToButton->setToolTip(QStringLiteral("选择目标目录并立即解压"));
-    actionRow->addWidget(m_selectButton);
-    actionRow->addWidget(m_extractHereButton);
-    actionRow->addWidget(m_extractToButton);
-    actionRow->addStretch(1);
-    rootLayout->addLayout(actionRow);
-
-    // 中部：文件列表 / 待压缩列表 / 任务日志
     m_tabs = new QTabWidget(central);
-    m_archivePage = new QWidget(m_tabs);
-    auto *archiveLayout = new QVBoxLayout(m_archivePage);
-    archiveLayout->setContentsMargins(8, 8, 8, 8);
-    archiveLayout->setSpacing(6);
-    m_archiveInfoLabel = new QLabel(
-        QStringLiteral("尚未打开压缩包。拖入压缩包，或点击“选择文件…”。"), m_archivePage);
+    m_archivePage = createArchivePage();
+    m_compressPage = createCompressPage();
+    m_logPage = createLogPage();
+    m_tabs->addTab(m_archivePage, QStringLiteral("压缩包内容"));
+    m_tabs->addTab(m_compressPage, QStringLiteral("压缩任务"));
+    m_tabs->addTab(m_logPage, QStringLiteral("运行日志"));
+    rootLayout->addWidget(m_tabs, 1);
+
+    auto *progressCard = new QFrame(central);
+    progressCard->setObjectName(QStringLiteral("progressCard"));
+    auto *progressRow = new QHBoxLayout(progressCard);
+    progressRow->setContentsMargins(10, 6, 10, 6);
+    progressRow->setSpacing(10);
+    m_progressLabel = new QLabel(QStringLiteral("就绪"), progressCard);
+    m_progressLabel->setMinimumWidth(230);
+    m_progressBar = new QProgressBar(progressCard);
+    m_progressBar->setRange(0, 100);
+    m_progressBar->setValue(0);
+    m_progressBar->setTextVisible(true);
+    m_cancelButton = new QPushButton(QStringLiteral("取消"), progressCard);
+    m_cancelButton->setEnabled(false);
+    progressRow->addWidget(m_progressLabel);
+    progressRow->addWidget(m_progressBar, 1);
+    progressRow->addWidget(m_cancelButton);
+    rootLayout->addWidget(progressCard);
+
+    setCentralWidget(central);
+
+    statusBar()->showMessage(QStringLiteral("就绪"));
+    m_statusFormatLabel = new QLabel(QStringLiteral("格式：—"), this);
+    m_statusCountLabel = new QLabel(QStringLiteral("条目：—"), this);
+    auto *versionLabel = new QLabel(QStringLiteral("StarZip 0.0.2"), this);
+    statusBar()->addPermanentWidget(m_statusFormatLabel);
+    statusBar()->addPermanentWidget(m_statusCountLabel);
+    statusBar()->addPermanentWidget(versionLabel);
+
+    connect(m_openButton, &QPushButton::clicked, this, &MainWindow::chooseArchive);
+    connect(m_browseTargetButton, &QPushButton::clicked, this, &MainWindow::chooseExtractTarget);
+    connect(m_extractHereButton, &QPushButton::clicked, this, &MainWindow::extractHere);
+    connect(m_extractToButton, &QPushButton::clicked, this, &MainWindow::extractToChosen);
+    connect(m_cancelButton, &QPushButton::clicked, this, &MainWindow::cancelCurrentTask);
+    connect(m_archiveTree, &QTreeWidget::itemSelectionChanged, this,
+            &MainWindow::onArchiveSelectionChanged);
+    connect(m_archiveTree, &QTreeWidget::customContextMenuRequested, this,
+            &MainWindow::showArchiveContextMenu);
+    connect(m_filterEdit, &QLineEdit::textChanged, this, &MainWindow::filterArchiveEntries);
+    connect(m_emptyOpenButton, &QPushButton::clicked, this, &MainWindow::chooseArchive);
+    connect(m_emptyNewButton, &QPushButton::clicked, this, &MainWindow::startNewArchive);
+
+    applyStyle();
+    m_uiReady = true;
+    updateArchiveHeader(QString(), 0, 0, false);
+    updateActions();
+}
+
+void MainWindow::setupActions()
+{
+    auto icon = [this](QStyle::StandardPixmap pixmap) {
+        return style()->standardIcon(pixmap);
+    };
+
+    m_openAction = new QAction(icon(QStyle::SP_DialogOpenButton),
+                               QStringLiteral("打开压缩包…"), this);
+    m_openAction->setShortcut(QKeySequence::Open);
+    m_openAction->setToolTip(QStringLiteral("打开本地压缩包 (Ctrl+O)"));
+    connect(m_openAction, &QAction::triggered, this, &MainWindow::chooseArchive);
+
+    m_newAction = new QAction(icon(QStyle::SP_FileDialogNewFolder),
+                              QStringLiteral("新建压缩任务"), this);
+    m_newAction->setShortcut(QKeySequence::New);
+    m_newAction->setToolTip(QStringLiteral("切换到压缩任务并添加文件 (Ctrl+N)"));
+    connect(m_newAction, &QAction::triggered, this, &MainWindow::startNewArchive);
+
+    m_addFilesAction = new QAction(QStringLiteral("添加文件…"), this);
+    connect(m_addFilesAction, &QAction::triggered, this, &MainWindow::addFiles);
+
+    m_addFolderAction = new QAction(QStringLiteral("添加文件夹…"), this);
+    connect(m_addFolderAction, &QAction::triggered, this, &MainWindow::addFolder);
+
+    m_compressAction = new QAction(icon(QStyle::SP_DialogSaveButton),
+                                   QStringLiteral("开始压缩"), this);
+    m_compressAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+C")));
+    connect(m_compressAction, &QAction::triggered, this, &MainWindow::createArchive);
+
+    m_extractHereAction = new QAction(icon(QStyle::SP_ArrowDown),
+                                      QStringLiteral("解压到此处"), this);
+    m_extractHereAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+E")));
+    connect(m_extractHereAction, &QAction::triggered, this, &MainWindow::extractHere);
+
+    m_extractToAction = new QAction(QStringLiteral("解压到…"), this);
+    m_extractToAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+E")));
+    connect(m_extractToAction, &QAction::triggered, this, &MainWindow::extractToChosen);
+
+    m_extractSelectedAction = new QAction(QStringLiteral("解压选中项"), this);
+    connect(m_extractSelectedAction, &QAction::triggered, this, &MainWindow::extractSelected);
+
+    m_testAction = new QAction(icon(QStyle::SP_DialogApplyButton),
+                               QStringLiteral("测试压缩包"), this);
+    m_testAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+T")));
+    connect(m_testAction, &QAction::triggered, this, &MainWindow::testArchive);
+
+    m_cancelAction = new QAction(icon(QStyle::SP_BrowserStop), QStringLiteral("取消任务"), this);
+    m_cancelAction->setShortcut(QKeySequence(Qt::Key_Escape));
+    connect(m_cancelAction, &QAction::triggered, this, &MainWindow::cancelCurrentTask);
+
+    m_logAction = new QAction(icon(QStyle::SP_FileDialogDetailedView),
+                              QStringLiteral("运行日志"), this);
+    m_logAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+L")));
+    connect(m_logAction, &QAction::triggered, this, &MainWindow::showLogTab);
+
+    m_aboutAction = new QAction(icon(QStyle::SP_MessageBoxInformation),
+                                QStringLiteral("关于 StarZip"), this);
+    connect(m_aboutAction, &QAction::triggered, this, &MainWindow::showAbout);
+
+    m_exitAction = new QAction(QStringLiteral("退出"), this);
+    m_exitAction->setShortcut(QKeySequence::Quit);
+    connect(m_exitAction, &QAction::triggered, this, &QWidget::close);
+
+    addAction(m_openAction);
+    addAction(m_newAction);
+    addAction(m_extractHereAction);
+    addAction(m_extractToAction);
+    addAction(m_testAction);
+    addAction(m_cancelAction);
+    addAction(m_logAction);
+    addAction(m_compressAction);
+}
+
+void MainWindow::setupMenus()
+{
+    QMenu *fileMenu = menuBar()->addMenu(QStringLiteral("文件(&F)"));
+    fileMenu->addAction(m_openAction);
+    m_recentMenu = fileMenu->addMenu(QStringLiteral("最近打开"));
+    fileMenu->addSeparator();
+    fileMenu->addAction(m_exitAction);
+
+    QMenu *compressMenu = menuBar()->addMenu(QStringLiteral("压缩(&C)"));
+    compressMenu->addAction(m_newAction);
+    compressMenu->addAction(m_addFilesAction);
+    compressMenu->addAction(m_addFolderAction);
+    compressMenu->addSeparator();
+    compressMenu->addAction(m_compressAction);
+
+    QMenu *actionMenu = menuBar()->addMenu(QStringLiteral("操作(&A)"));
+    actionMenu->addAction(m_extractHereAction);
+    actionMenu->addAction(m_extractToAction);
+    actionMenu->addAction(m_extractSelectedAction);
+    actionMenu->addSeparator();
+    actionMenu->addAction(m_testAction);
+    actionMenu->addAction(m_cancelAction);
+
+    QMenu *viewMenu = menuBar()->addMenu(QStringLiteral("视图(&V)"));
+    viewMenu->addAction(m_logAction);
+
+    QMenu *helpMenu = menuBar()->addMenu(QStringLiteral("帮助(&H)"));
+    helpMenu->addAction(m_aboutAction);
+}
+
+void MainWindow::setupToolBar()
+{
+    m_toolBar = addToolBar(QStringLiteral("主工具栏"));
+    m_toolBar->setObjectName(QStringLiteral("mainToolBar"));
+    m_toolBar->setMovable(false);
+    m_toolBar->setFloatable(false);
+    m_toolBar->setIconSize(QSize(20, 20));
+    m_toolBar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+
+    auto *brand = new QLabel(QStringLiteral("<b>StarZip</b> "
+                                            "<span style='color:#6b7280;font-weight:normal'>0.0.2</span>"),
+                             m_toolBar);
+    brand->setObjectName(QStringLiteral("brandLabel"));
+    brand->setContentsMargins(6, 0, 14, 0);
+    m_toolBar->addWidget(brand);
+    m_toolBar->addAction(m_openAction);
+    m_toolBar->addAction(m_newAction);
+    m_toolBar->addSeparator();
+    m_toolBar->addAction(m_extractHereAction);
+    m_toolBar->addAction(m_testAction);
+    m_toolBar->addSeparator();
+    m_toolBar->addAction(m_cancelAction);
+
+    auto *spacer = new QWidget(m_toolBar);
+    spacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    m_toolBar->addWidget(spacer);
+    m_toolBar->addAction(m_logAction);
+}
+
+QWidget *MainWindow::createEmptyPage()
+{
+    m_emptyPage = new QWidget;
+    auto *layout = new QVBoxLayout(m_emptyPage);
+    layout->setContentsMargins(40, 30, 40, 30);
+    layout->setSpacing(10);
+    layout->addStretch(1);
+
+    m_emptyIcon = new QLabel(m_emptyPage);
+    m_emptyIcon->setAlignment(Qt::AlignCenter);
+    m_emptyIcon->setPixmap(windowIcon().pixmap(72, 72));
+    layout->addWidget(m_emptyIcon);
+
+    m_emptyTitle = new QLabel(QStringLiteral("打开或拖入一个压缩包"), m_emptyPage);
+    m_emptyTitle->setObjectName(QStringLiteral("emptyTitle"));
+    m_emptyTitle->setAlignment(Qt::AlignCenter);
+    layout->addWidget(m_emptyTitle);
+
+    m_emptyHint = new QLabel(
+        QStringLiteral("支持从本地浏览选择，也可以直接把压缩包拖到窗口。\n"
+                       "ZIP / 7Z / RAR 的解压、列表、进度与密码提示保持一致。"),
+        m_emptyPage);
+    m_emptyHint->setObjectName(QStringLiteral("emptyHint"));
+    m_emptyHint->setAlignment(Qt::AlignCenter);
+    m_emptyHint->setWordWrap(true);
+    layout->addWidget(m_emptyHint);
+
+    m_emptyFormats = new QLabel(
+        QStringLiteral("ZIP · 7Z · RAR · RAR5 · TAR · GZ · XZ · CAB · ISO"), m_emptyPage);
+    m_emptyFormats->setObjectName(QStringLiteral("emptyFormats"));
+    m_emptyFormats->setAlignment(Qt::AlignCenter);
+    layout->addWidget(m_emptyFormats);
+
+    auto *buttonRow = new QHBoxLayout();
+    buttonRow->addStretch(1);
+    m_emptyOpenButton = new QPushButton(QStringLiteral("打开压缩包…"), m_emptyPage);
+    m_emptyOpenButton->setObjectName(QStringLiteral("primaryButton"));
+    m_emptyOpenButton->setMinimumWidth(140);
+    m_emptyNewButton = new QPushButton(QStringLiteral("新建压缩任务"), m_emptyPage);
+    m_emptyNewButton->setMinimumWidth(140);
+    buttonRow->addWidget(m_emptyOpenButton);
+    buttonRow->addWidget(m_emptyNewButton);
+    buttonRow->addStretch(1);
+    layout->addSpacing(6);
+    layout->addLayout(buttonRow);
+
+    auto *dragHint = new QLabel(
+        QStringLiteral("拖入文件或文件夹到“压缩任务”页面，即可直接打包"), m_emptyPage);
+    dragHint->setObjectName(QStringLiteral("emptyHint"));
+    dragHint->setAlignment(Qt::AlignCenter);
+    layout->addWidget(dragHint);
+    layout->addStretch(1);
+    return m_emptyPage;
+}
+
+QWidget *MainWindow::createArchivePage()
+{
+    m_archivePage = new QWidget;
+    auto *pageLayout = new QVBoxLayout(m_archivePage);
+    pageLayout->setContentsMargins(0, 0, 0, 0);
+    pageLayout->setSpacing(0);
+
+    m_archiveStack = new QStackedWidget(m_archivePage);
+    pageLayout->addWidget(m_archiveStack);
+
+    m_archiveStack->addWidget(createEmptyPage());
+
+    m_contentPage = new QWidget(m_archivePage);
+    auto *contentLayout = new QVBoxLayout(m_contentPage);
+    contentLayout->setContentsMargins(8, 8, 8, 8);
+    contentLayout->setSpacing(8);
+
+    auto *headerCard = new QFrame(m_contentPage);
+    headerCard->setObjectName(QStringLiteral("infoCard"));
+    auto *headerLayout = new QHBoxLayout(headerCard);
+    headerLayout->setContentsMargins(10, 8, 10, 8);
+    headerLayout->setSpacing(10);
+    m_formatBadge = new QLabel(QStringLiteral("—"), headerCard);
+    m_formatBadge->setObjectName(QStringLiteral("formatBadge"));
+    m_formatBadge->setAlignment(Qt::AlignCenter);
+    m_formatBadge->setMinimumWidth(72);
+    m_archiveInfoLabel = new QLabel(QStringLiteral("尚未打开压缩包。"), headerCard);
+    m_archiveInfoLabel->setObjectName(QStringLiteral("archiveInfoLabel"));
     m_archiveInfoLabel->setWordWrap(true);
     m_archiveInfoLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    m_archiveTree = new QTreeWidget(m_archivePage);
-    m_archiveTree->setColumnCount(3);
+    m_archiveInfoLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    auto *filterCaption = new QLabel(QStringLiteral("筛选"), headerCard);
+    filterCaption->setObjectName(QStringLiteral("fieldLabel"));
+    m_filterEdit = new QLineEdit(headerCard);
+    m_filterEdit->setPlaceholderText(QStringLiteral("按名称筛选…"));
+    m_filterEdit->setClearButtonEnabled(true);
+    m_filterEdit->setFixedWidth(210);
+    headerLayout->addWidget(m_formatBadge);
+    headerLayout->addWidget(m_archiveInfoLabel, 1);
+    headerLayout->addWidget(filterCaption);
+    headerLayout->addWidget(m_filterEdit);
+    contentLayout->addWidget(headerCard);
+
+    m_archiveTree = new QTreeWidget(m_contentPage);
+    m_archiveTree->setColumnCount(5);
     m_archiveTree->setHeaderLabels({QStringLiteral("名称"), QStringLiteral("大小"),
-                                    QStringLiteral("修改时间")});
-    m_archiveTree->setRootIsDecorated(false);
+                                    QStringLiteral("类型"), QStringLiteral("修改时间"),
+                                    QStringLiteral("加密")});
+    m_archiveTree->setRootIsDecorated(true);
     m_archiveTree->setAlternatingRowColors(true);
     m_archiveTree->setUniformRowHeights(true);
     m_archiveTree->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    m_archiveTree->setContextMenuPolicy(Qt::CustomContextMenu);
     m_archiveTree->header()->setSectionResizeMode(0, QHeaderView::Stretch);
     m_archiveTree->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
     m_archiveTree->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
-    archiveLayout->addWidget(m_archiveInfoLabel);
-    archiveLayout->addWidget(m_archiveTree, 1);
-    m_tabs->addTab(m_archivePage, QStringLiteral("压缩包内容"));
+    m_archiveTree->header()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+    m_archiveTree->header()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
+    contentLayout->addWidget(m_archiveTree, 1);
 
-    m_sourcesPage = new QWidget(m_tabs);
-    auto *sourcesLayout = new QVBoxLayout(m_sourcesPage);
-    sourcesLayout->setContentsMargins(8, 8, 8, 8);
-    sourcesLayout->setSpacing(8);
-    auto *sourceActions = new QHBoxLayout();
-    sourceActions->setSpacing(8);
-    m_addFilesButton = new QPushButton(QStringLiteral("添加文件…"), m_sourcesPage);
-    m_addFolderButton = new QPushButton(QStringLiteral("添加文件夹…"), m_sourcesPage);
-    m_removeSourceButton = new QPushButton(QStringLiteral("移除选中"), m_sourcesPage);
-    m_clearSourcesButton = new QPushButton(QStringLiteral("清空"), m_sourcesPage);
-    m_createZipButton = new QPushButton(QStringLiteral("压缩为 ZIP…"), m_sourcesPage);
-    m_createZipButton->setObjectName(QStringLiteral("primaryButton"));
-    m_createZipButton->setToolTip(
-        QStringLiteral("0.0.1 仅创建 ZIP；RAR/7Z 用于解压，不支持创建"));
-    sourceActions->addWidget(m_addFilesButton);
-    sourceActions->addWidget(m_addFolderButton);
-    sourceActions->addWidget(m_removeSourceButton);
-    sourceActions->addWidget(m_clearSourcesButton);
-    sourceActions->addStretch(1);
-    sourceActions->addWidget(m_createZipButton);
-    m_sourcesTree = new QTreeWidget(m_sourcesPage);
-    m_sourcesTree->setColumnCount(3);
+    auto *bottomRow = new QHBoxLayout();
+    bottomRow->setSpacing(8);
+    m_extractSelectedButton = new QPushButton(QStringLiteral("解压选中项…"), m_contentPage);
+    m_extractSelectedButton->setToolTip(QStringLiteral("仅解压列表中选中的文件或文件夹"));
+    m_testButton = new QPushButton(QStringLiteral("测试压缩包"), m_contentPage);
+    m_testButton->setToolTip(QStringLiteral("读取并校验全部数据（Ctrl+T）"));
+    auto *treeHint = new QLabel(
+        QStringLiteral("双击文件夹展开/折叠 · 右键可复制路径或解压选中项"), m_contentPage);
+    treeHint->setObjectName(QStringLiteral("mutedLabel"));
+    bottomRow->addWidget(m_extractSelectedButton);
+    bottomRow->addWidget(m_testButton);
+    bottomRow->addStretch(1);
+    bottomRow->addWidget(treeHint);
+    contentLayout->addLayout(bottomRow);
+
+    connect(m_extractSelectedButton, &QPushButton::clicked, this, &MainWindow::extractSelected);
+    connect(m_testButton, &QPushButton::clicked, this, &MainWindow::testArchive);
+
+    m_archiveStack->addWidget(m_contentPage);
+    m_archiveStack->setCurrentWidget(m_emptyPage);
+    return m_archivePage;
+}
+
+QWidget *MainWindow::createCompressPage()
+{
+    m_compressPage = new QWidget;
+    auto *layout = new QVBoxLayout(m_compressPage);
+    layout->setContentsMargins(8, 8, 8, 8);
+    layout->setSpacing(8);
+
+    auto *sourceRow = new QHBoxLayout();
+    sourceRow->setSpacing(8);
+    auto *sourceCaption = new QLabel(QStringLiteral("待压缩内容"), m_compressPage);
+    sourceCaption->setObjectName(QStringLiteral("sectionLabel"));
+    m_addFilesButton = new QPushButton(QStringLiteral("添加文件…"), m_compressPage);
+    m_addFolderButton = new QPushButton(QStringLiteral("添加文件夹…"), m_compressPage);
+    m_removeSourceButton = new QPushButton(QStringLiteral("移除选中"), m_compressPage);
+    m_clearSourcesButton = new QPushButton(QStringLiteral("清空"), m_compressPage);
+    sourceRow->addWidget(sourceCaption);
+    sourceRow->addWidget(m_addFilesButton);
+    sourceRow->addWidget(m_addFolderButton);
+    sourceRow->addWidget(m_removeSourceButton);
+    sourceRow->addWidget(m_clearSourcesButton);
+    sourceRow->addStretch(1);
+    layout->addLayout(sourceRow);
+
+    m_sourcesTree = new QTreeWidget(m_compressPage);
+    m_sourcesTree->setColumnCount(4);
     m_sourcesTree->setHeaderLabels({QStringLiteral("名称"), QStringLiteral("类型"),
-                                    QStringLiteral("路径")});
+                                    QStringLiteral("大小"), QStringLiteral("路径")});
     m_sourcesTree->setRootIsDecorated(false);
     m_sourcesTree->setAlternatingRowColors(true);
     m_sourcesTree->setUniformRowHeights(true);
     m_sourcesTree->setSelectionMode(QAbstractItemView::ExtendedSelection);
     m_sourcesTree->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
     m_sourcesTree->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
-    m_sourcesTree->header()->setSectionResizeMode(2, QHeaderView::Stretch);
-    auto *sourceHint = new QLabel(
-        QStringLiteral("添加要打包的文件或文件夹，点击右侧“压缩为 ZIP…”选择输出位置。"),
-        m_sourcesPage);
-    sourceHint->setWordWrap(true);
-    sourcesLayout->addLayout(sourceActions);
-    sourcesLayout->addWidget(sourceHint);
-    sourcesLayout->addWidget(m_sourcesTree, 1);
-    m_tabs->addTab(m_sourcesPage, QStringLiteral("压缩任务"));
+    m_sourcesTree->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    m_sourcesTree->header()->setSectionResizeMode(3, QHeaderView::Stretch);
+    layout->addWidget(m_sourcesTree, 1);
 
-    m_logPage = new QWidget(m_tabs);
-    auto *logLayout = new QVBoxLayout(m_logPage);
-    logLayout->setContentsMargins(8, 8, 8, 8);
-    m_logView = new QPlainTextEdit(m_logPage);
-    m_logView->setReadOnly(true);
-    m_logView->setMaximumBlockCount(3000);
-    m_logView->setPlaceholderText(QStringLiteral("任务日志将显示在这里。"));
-    logLayout->addWidget(m_logView);
-    m_tabs->addTab(m_logPage, QStringLiteral("运行日志"));
+    auto *settingsBox = new QGroupBox(QStringLiteral("压缩设置"), m_compressPage);
+    auto *grid = new QGridLayout(settingsBox);
+    grid->setContentsMargins(12, 14, 12, 10);
+    grid->setHorizontalSpacing(10);
+    grid->setVerticalSpacing(8);
 
-    rootLayout->addWidget(m_tabs, 1);
+    auto *formatLabel = new QLabel(QStringLiteral("输出格式"), settingsBox);
+    formatLabel->setObjectName(QStringLiteral("fieldLabel"));
+    m_formatCombo = new QComboBox(settingsBox);
+    m_levelCombo = new QComboBox(settingsBox);
+    const QVector<FormatChoice> choices = formatChoices();
+    for (const FormatChoice &choice : choices)
+        m_formatCombo->addItem(choice.label, choice.id);
+    m_levelCombo->addItem(QStringLiteral("仅存储 (0)"), 0);
+    m_levelCombo->addItem(QStringLiteral("快速 (1)"), 1);
+    m_levelCombo->addItem(QStringLiteral("标准 (6)"), 6);
+    m_levelCombo->addItem(QStringLiteral("较高 (7)"), 7);
+    m_levelCombo->addItem(QStringLiteral("极限 (9)"), 9);
+    m_levelCombo->setCurrentIndex(2);
 
-    // 底部进度区
-    auto *progressRow = new QHBoxLayout();
-    progressRow->setSpacing(10);
-    m_progressLabel = new QLabel(QStringLiteral("就绪"), central);
-    m_progressLabel->setMinimumWidth(150);
-    m_progressBar = new QProgressBar(central);
-    m_progressBar->setRange(0, 100);
-    m_progressBar->setValue(0);
-    m_progressBar->setTextVisible(true);
-    m_cancelButton = new QPushButton(QStringLiteral("取消任务"), central);
-    m_cancelButton->setEnabled(false);
-    progressRow->addWidget(m_progressLabel);
-    progressRow->addWidget(m_progressBar, 1);
-    progressRow->addWidget(m_cancelButton);
-    rootLayout->addLayout(progressRow);
+    auto *levelLabel = new QLabel(QStringLiteral("压缩级别"), settingsBox);
+    levelLabel->setObjectName(QStringLiteral("fieldLabel"));
+    grid->addWidget(formatLabel, 0, 0);
+    grid->addWidget(m_formatCombo, 0, 1);
+    grid->addWidget(levelLabel, 0, 2);
+    grid->addWidget(m_levelCombo, 0, 3);
+    grid->setColumnStretch(1, 1);
+    grid->setColumnStretch(3, 1);
 
-    setCentralWidget(central);
+    auto *passwordLabel = new QLabel(QStringLiteral("密码"), settingsBox);
+    passwordLabel->setObjectName(QStringLiteral("fieldLabel"));
+    m_passwordEdit = new QLineEdit(settingsBox);
+    m_passwordEdit->setEchoMode(QLineEdit::Password);
+    m_passwordEdit->setPlaceholderText(QStringLiteral("可选：为 ZIP 设置解压密码"));
+    m_showPasswordCheck = new QCheckBox(QStringLiteral("显示"), settingsBox);
+    m_passwordNote = new QLabel(settingsBox);
+    m_passwordNote->setObjectName(QStringLiteral("mutedLabel"));
+    m_passwordNote->setWordWrap(true);
+    grid->addWidget(passwordLabel, 1, 0);
+    grid->addWidget(m_passwordEdit, 1, 1);
+    grid->addWidget(m_showPasswordCheck, 1, 2);
+    grid->addWidget(m_passwordNote, 1, 3, 1, 2);
 
-    // 状态栏
-    statusBar()->showMessage(QStringLiteral("就绪"));
-    auto *versionLabel = new QLabel(QStringLiteral("StarZip 0.0.1"), this);
-    statusBar()->addPermanentWidget(versionLabel);
+    auto *outputLabel = new QLabel(QStringLiteral("输出文件"), settingsBox);
+    outputLabel->setObjectName(QStringLiteral("fieldLabel"));
+    m_outputEdit = new QLineEdit(settingsBox);
+    m_outputEdit->setPlaceholderText(QStringLiteral("留空会在压缩时询问保存位置"));
+    m_browseOutputButton = new QPushButton(QStringLiteral("浏览…"), settingsBox);
+    grid->addWidget(outputLabel, 2, 0);
+    grid->addWidget(m_outputEdit, 2, 1, 1, 2);
+    grid->addWidget(m_browseOutputButton, 2, 3);
 
-    connect(m_selectButton, &QPushButton::clicked, this, &MainWindow::chooseArchive);
-    connect(m_browseTargetButton, &QPushButton::clicked, this, &MainWindow::chooseExtractTarget);
-    connect(m_extractHereButton, &QPushButton::clicked, this, &MainWindow::extractHere);
-    connect(m_extractToButton, &QPushButton::clicked, this, &MainWindow::extractToChosen);
-    connect(m_cancelButton, &QPushButton::clicked, this, &MainWindow::cancelCurrentTask);
+    auto *compressHint = new QLabel(
+        QStringLiteral("ZIP 支持 AES-256 密码；7Z 使用 LZMA2；TAR 系列适合跨平台归档。"
+                       "创建 RAR 不在本版本范围内。"),
+        settingsBox);
+    compressHint->setObjectName(QStringLiteral("mutedLabel"));
+    compressHint->setWordWrap(true);
+    m_createArchiveButton = new QPushButton(QStringLiteral("开始压缩"), settingsBox);
+    m_createArchiveButton->setObjectName(QStringLiteral("primaryButton"));
+    m_createArchiveButton->setMinimumWidth(130);
+    grid->addWidget(compressHint, 3, 0, 1, 3);
+    grid->addWidget(m_createArchiveButton, 3, 3, Qt::AlignRight);
+    layout->addWidget(settingsBox);
+
     connect(m_addFilesButton, &QPushButton::clicked, this, &MainWindow::addFiles);
     connect(m_addFolderButton, &QPushButton::clicked, this, &MainWindow::addFolder);
-    connect(m_removeSourceButton, &QPushButton::clicked, this, &MainWindow::removeSelectedSources);
+    connect(m_removeSourceButton, &QPushButton::clicked, this,
+            &MainWindow::removeSelectedSources);
     connect(m_clearSourcesButton, &QPushButton::clicked, this, &MainWindow::clearSources);
-    connect(m_createZipButton, &QPushButton::clicked, this, &MainWindow::createZip);
     connect(m_sourcesTree, &QTreeWidget::itemSelectionChanged, this, &MainWindow::updateActions);
+    connect(m_formatCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+            &MainWindow::onFormatChanged);
+    connect(m_showPasswordCheck, &QCheckBox::toggled, this, &MainWindow::togglePasswordVisible);
+    connect(m_browseOutputButton, &QPushButton::clicked, this, &MainWindow::browseOutput);
+    connect(m_createArchiveButton, &QPushButton::clicked, this, &MainWindow::createArchive);
 
+    onFormatChanged();
+    return m_compressPage;
+}
+
+QWidget *MainWindow::createLogPage()
+{
+    m_logPage = new QWidget;
+    auto *layout = new QVBoxLayout(m_logPage);
+    layout->setContentsMargins(8, 8, 8, 8);
+    m_logView = new QPlainTextEdit(m_logPage);
+    m_logView->setReadOnly(true);
+    m_logView->setMaximumBlockCount(5000);
+    m_logView->setPlaceholderText(QStringLiteral("任务日志将显示在这里。"));
+    layout->addWidget(m_logView);
+    return m_logPage;
+}
+
+void MainWindow::applyStyle()
+{
     setStyleSheet(QStringLiteral(R"(
-        QMainWindow { background: #f5f7fb; }
-        QLabel { color: #26324a; }
-        QFrame#dropZone {
-            background: #ffffff;
-            border: 2px dashed #8fa2ff;
-            border-radius: 12px;
+        QWidget#appRoot { background: #eef1f5; }
+        QMainWindow { background: #eef1f5; }
+        QMenuBar { background: #ffffff; border-bottom: 1px solid #d7dce4; padding: 1px 4px; }
+        QMenuBar::item { padding: 5px 10px; background: transparent; }
+        QMenuBar::item:selected { background: #eaf0fa; border-radius: 3px; }
+        QMenu { background: #ffffff; border: 1px solid #cbd2dc; padding: 4px; }
+        QMenu::item { padding: 6px 28px 6px 22px; }
+        QMenu::item:selected { background: #e8effb; color: #17346b; }
+        QMenu::separator { height: 1px; background: #e4e8ee; margin: 4px 8px; }
+        QToolBar#mainToolBar {
+            background: #ffffff; border-bottom: 1px solid #d7dce4;
+            spacing: 3px; padding: 4px 8px;
         }
-        QFrame#dropZone[dragActive="true"] {
-            background: #eef3ff;
-            border: 2px solid #4f6bff;
+        QToolBar#mainToolBar QToolButton {
+            padding: 4px 9px; border: 1px solid transparent; border-radius: 3px;
+            color: #263449;
         }
-        QLabel#dropTitle { font-size: 20px; font-weight: 600; color: #1f2a44; }
-        QLabel#dropHint { color: #6f7890; }
+        QToolBar#mainToolBar QToolButton:hover {
+            background: #eef3fb; border-color: #c9d5e6;
+        }
+        QToolBar#mainToolBar QToolButton:pressed { background: #dfe9f8; }
+        QToolBar#mainToolBar QToolButton:disabled { color: #98a1b1; }
+        QLabel#brandLabel { color: #1f2f4d; }
+        QFrame#pathCard, QFrame#infoCard, QFrame#progressCard {
+            background: #ffffff; border: 1px solid #d5dbe4; border-radius: 4px;
+        }
+        QLabel#fieldLabel, QLabel#sectionLabel { color: #5b6577; }
+        QLabel#sectionLabel { font-weight: 600; }
+        QLabel#archivePathLabel { color: #1d2b44; }
+        QLabel#mutedLabel { color: #7a8496; }
+        QLabel#formatBadge {
+            background: #e8f0ff; color: #1d4ed8; border: 1px solid #bfd3ff;
+            border-radius: 4px; font-weight: 600; padding: 4px 8px;
+        }
+        QLabel#emptyTitle { font-size: 19pt; font-weight: 600; color: #1f2a3d; }
+        QLabel#emptyHint { color: #6f7a8c; }
+        QLabel#emptyFormats {
+            color: #2f5fbf; background: #f2f6fd; border: 1px solid #d9e5fa;
+            border-radius: 11px; padding: 3px 14px;
+        }
         QPushButton {
-            padding: 6px 14px;
-            border: 1px solid #cfd5e3;
-            border-radius: 6px;
-            background: #ffffff;
-            color: #26324a;
+            background: #ffffff; color: #263449; border: 1px solid #c8d0dc;
+            border-radius: 3px; padding: 5px 12px; min-height: 22px;
         }
-        QPushButton:hover { background: #f0f4ff; border-color: #8fa2ff; }
-        QPushButton:pressed { background: #e3eaff; }
-        QPushButton:disabled { color: #9aa3b5; background: #f3f4f7; border-color: #e2e5ed; }
+        QPushButton:hover { background: #f4f7fb; border-color: #aebbd0; }
+        QPushButton:pressed { background: #e8eef7; }
+        QPushButton:disabled { color: #9aa3b3; background: #f4f5f8; border-color: #e1e5ec; }
         QPushButton#primaryButton {
-            background: #4f6bff; color: #ffffff; border-color: #4f6bff;
+            background: #2563eb; color: #ffffff; border-color: #2563eb; font-weight: 600;
         }
-        QPushButton#primaryButton:hover { background: #3e58e8; border-color: #3e58e8; }
-        QPushButton#primaryButton:disabled { background: #b8c2e8; border-color: #b8c2e8; }
-        QLineEdit {
-            padding: 6px 8px; border: 1px solid #cfd5e3;
-            border-radius: 6px; background: #ffffff;
+        QPushButton#primaryButton:hover { background: #1d4ed8; border-color: #1d4ed8; }
+        QPushButton#primaryButton:pressed { background: #1e40af; }
+        QPushButton#primaryButton:disabled {
+            background: #b9c8e8; border-color: #b9c8e8; color: #f1f5ff;
         }
-        QLineEdit:focus { border-color: #4f6bff; }
-        QTabWidget::pane {
-            border: 1px solid #dfe3ec;
-            border-radius: 8px;
-            background: #ffffff;
+        QLineEdit, QComboBox {
+            background: #ffffff; color: #1f2a3d; border: 1px solid #c8d0dc;
+            border-radius: 3px; padding: 4px 7px; min-height: 22px;
         }
+        QLineEdit:focus, QComboBox:focus { border-color: #2563eb; }
+        QLineEdit:disabled, QComboBox:disabled { background: #f4f5f8; color: #9aa3b3; }
+        QComboBox::drop-down { border: none; width: 20px; }
+        QCheckBox { color: #3d4759; spacing: 5px; }
+        QGroupBox {
+            background: #ffffff; border: 1px solid #d5dbe4; border-radius: 4px;
+            margin-top: 9px; padding-top: 8px; font-weight: 600; color: #334155;
+        }
+        QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
+        QTabWidget::pane { border: 1px solid #d5dbe4; background: #ffffff; }
         QTabBar::tab {
-            padding: 7px 16px;
-            margin-right: 2px;
-            color: #5b6478;
-            background: transparent;
+            background: #e4e9f0; color: #4b5567; border: 1px solid #d5dbe4;
+            border-bottom: none; padding: 6px 18px; margin-right: 2px;
         }
-        QTabBar::tab:selected { color: #3448c5; font-weight: 600; }
+        QTabBar::tab:selected { background: #ffffff; color: #17408f; font-weight: 600; }
+        QTabBar::tab:hover:!selected { background: #edf1f7; }
         QTreeWidget, QPlainTextEdit {
-            border: none;
-            background: #ffffff;
-            alternate-background-color: #fafbff;
+            background: #ffffff; border: 1px solid #d5dbe4; alternate-background-color: #fafbfd;
+            selection-background-color: #dbeafe; selection-color: #172033;
         }
+        QTreeWidget::item { height: 24px; }
+        QTreeWidget::item:hover { background: #edf4ff; }
         QHeaderView::section {
-            background: #f2f5fb;
-            border: none;
-            border-bottom: 1px solid #dfe3ec;
-            padding: 6px;
-            color: #4b556b;
+            background: #f3f5f8; color: #4b5567; border: none;
+            border-right: 1px solid #e2e6ed; border-bottom: 1px solid #d5dbe4;
+            padding: 5px 6px;
         }
         QProgressBar {
-            border: 1px solid #dfe3ec;
-            border-radius: 6px;
-            background: #ffffff;
-            text-align: center;
-            min-height: 20px;
+            border: 1px solid #d5dbe4; border-radius: 3px; background: #ffffff;
+            text-align: center; min-height: 20px; color: #334155;
         }
-        QProgressBar::chunk { background: #4f6bff; border-radius: 5px; }
-        QStatusBar { background: #eef1f7; color: #4b556b; }
+        QProgressBar::chunk { background: #2563eb; }
+        QStatusBar { background: #e8ecf2; color: #4b5567; border-top: 1px solid #d5dbe4; }
+        QStatusBar QLabel { color: #5b6577; padding: 0 6px; }
+        QSplitter::handle { background: #eef1f5; }
     )"));
+}
 
-    refreshSourcesSummary();
+void MainWindow::rebuildRecentMenu()
+{
+    if (!m_recentMenu)
+        return;
+    m_recentMenu->clear();
+    QSettings settings;
+    const QStringList recent = settings.value(QStringLiteral("recentFiles")).toStringList();
+    if (recent.isEmpty()) {
+        QAction *empty = m_recentMenu->addAction(QStringLiteral("暂无记录"));
+        empty->setEnabled(false);
+        return;
+    }
+    for (const QString &path : recent) {
+        if (!QFileInfo::exists(path))
+            continue;
+        QAction *action = m_recentMenu->addAction(archiveDisplayName(path));
+        action->setToolTip(QDir::toNativeSeparators(path));
+        connect(action, &QAction::triggered, this, [this, path]() { openArchive(path); });
+    }
+    m_recentMenu->addSeparator();
+    QAction *clear = m_recentMenu->addAction(QStringLiteral("清除记录"));
+    connect(clear, &QAction::triggered, this, &MainWindow::clearRecentFiles);
+}
+
+void MainWindow::addRecentFile(const QString &path)
+{
+    if (path.isEmpty())
+        return;
+    QSettings settings;
+    QStringList recent = settings.value(QStringLiteral("recentFiles")).toStringList();
+    for (int i = recent.size() - 1; i >= 0; --i) {
+        if (recent.at(i).compare(path, Qt::CaseInsensitive) == 0)
+            recent.removeAt(i);
+    }
+    recent.prepend(path);
+    while (recent.size() > 8)
+        recent.removeLast();
+    settings.setValue(QStringLiteral("recentFiles"), recent);
+    rebuildRecentMenu();
+}
+
+void MainWindow::clearRecentFiles()
+{
+    QSettings settings;
+    settings.remove(QStringLiteral("recentFiles"));
+    rebuildRecentMenu();
 }
 
 void MainWindow::dragEnterEvent(QDragEnterEvent *event)
@@ -341,9 +798,9 @@ void MainWindow::dragEnterEvent(QDragEnterEvent *event)
         return;
     }
     for (const QUrl &url : event->mimeData()->urls()) {
-        if (urlIsLocalFile(url)) {
+        if (urlIsLocalPath(url)) {
             event->acceptProposedAction();
-            setDropZoneActive(true);
+            statusBar()->showMessage(QStringLiteral("松开鼠标：打开压缩包，或添加到压缩任务。"));
             return;
         }
     }
@@ -357,9 +814,8 @@ void MainWindow::dragMoveEvent(QDragMoveEvent *event)
         return;
     }
     for (const QUrl &url : event->mimeData()->urls()) {
-        if (urlIsLocalFile(url)) {
+        if (urlIsLocalPath(url)) {
             event->acceptProposedAction();
-            setDropZoneActive(true);
             return;
         }
     }
@@ -368,37 +824,45 @@ void MainWindow::dragMoveEvent(QDragMoveEvent *event)
 
 void MainWindow::dragLeaveEvent(QDragLeaveEvent *event)
 {
-    setDropZoneActive(false);
+    statusBar()->showMessage(QStringLiteral("就绪"), 2000);
     QMainWindow::dragLeaveEvent(event);
 }
 
 void MainWindow::dropEvent(QDropEvent *event)
 {
-    setDropZoneActive(false);
     if (m_busy) {
         event->ignore();
         return;
     }
 
-    QStringList localFiles;
+    QStringList localPaths;
     if (event->mimeData()->hasUrls()) {
         for (const QUrl &url : event->mimeData()->urls()) {
-            if (urlIsLocalFile(url))
-                localFiles.append(url.toLocalFile());
+            if (urlIsLocalPath(url))
+                localPaths.append(url.toLocalFile());
         }
     }
-    if (localFiles.isEmpty()) {
+    if (localPaths.isEmpty()) {
         event->ignore();
         return;
     }
-
     event->acceptProposedAction();
-    if (localFiles.size() > 1) {
-        statusBar()->showMessage(QStringLiteral("一次只处理一个压缩包，已打开第一个文件。"), 6000);
-        appendLog(QStringLiteral("拖入了多个文件，仅打开第一个：%1")
-                      .arg(QDir::toNativeSeparators(localFiles.first())));
+
+    const bool compressDrop = m_tabs->currentWidget() == m_compressPage;
+    if (compressDrop || localPaths.size() > 1 || QFileInfo(localPaths.first()).isDir()) {
+        for (const QString &path : localPaths)
+            addSourcePath(path);
+        refreshSourcesSummary();
+        m_tabs->setCurrentWidget(m_compressPage);
+        statusBar()->showMessage(QStringLiteral("已添加 %1 个待压缩项目。").arg(localPaths.size()),
+                                 5000);
+        appendLog(QStringLiteral("拖入并添加 %1 个待压缩项目。").arg(localPaths.size()));
+        return;
     }
-    openArchive(localFiles.first());
+
+    appendLog(QStringLiteral("拖入压缩包：%1")
+                  .arg(QDir::toNativeSeparators(localPaths.first())));
+    openArchive(localPaths.first());
 }
 
 void MainWindow::closeEvent(QCloseEvent *event)
@@ -429,7 +893,25 @@ void MainWindow::closeEvent(QCloseEvent *event)
             return;
         }
     }
+
+    QSettings settings;
+    settings.setValue(QStringLiteral("windowGeometry"), saveGeometry());
     event->accept();
+}
+
+void MainWindow::openArchivePath(const QString &path)
+{
+    if (path.isEmpty())
+        return;
+    const QFileInfo info(path);
+    if (!info.exists() || !info.isFile()) {
+        showError(QStringLiteral("无法打开压缩包"),
+                  QStringLiteral("文件不存在或不是普通文件：\n%1")
+                      .arg(QDir::toNativeSeparators(path)));
+        return;
+    }
+    m_tabs->setCurrentWidget(m_archivePage);
+    openArchive(info.absoluteFilePath());
 }
 
 void MainWindow::chooseArchive()
@@ -438,15 +920,20 @@ void MainWindow::chooseArchive()
         statusBar()->showMessage(QStringLiteral("当前有任务正在进行，请稍候。"), 4000);
         return;
     }
+    QSettings settings;
+    const QString start = settings.value(QStringLiteral("lastOpenDir"), QDir::currentPath())
+                              .toString();
     const QString path = QFileDialog::getOpenFileName(
-        this, QStringLiteral("选择压缩包"), QDir::currentPath(),
+        this, QStringLiteral("打开压缩包"), start,
         QStringLiteral("压缩包 (*.zip *.7z *.rar *.tar *.gz *.tgz *.bz2 *.xz *.lzma *.cab *.iso);;"
                        "所有文件 (*.*)"));
-    if (!path.isEmpty())
-        openArchive(path);
+    if (path.isEmpty())
+        return;
+    settings.setValue(QStringLiteral("lastOpenDir"), QFileInfo(path).absolutePath());
+    openArchive(path);
 }
 
-void MainWindow::openArchive(const QString &path)
+void MainWindow::openArchive(const QString &path, const QString &password, bool retry)
 {
     if (m_busy) {
         statusBar()->showMessage(QStringLiteral("当前有任务正在进行，请稍候。"), 4000);
@@ -460,21 +947,38 @@ void MainWindow::openArchive(const QString &path)
         return;
     }
 
+    if (!retry) {
+        m_archivePassword.clear();
+        m_passwordAttempts = 0;
+        m_passwordSignal = false;
+    }
+    if (!password.isEmpty())
+        m_archivePassword = password;
+
     m_archivePath = info.absoluteFilePath();
     m_archiveLabel->setText(QDir::toNativeSeparators(m_archivePath));
     m_archiveLabel->setToolTip(QDir::toNativeSeparators(m_archivePath));
-    m_archiveInfoLabel->setText(QStringLiteral("正在识别压缩包格式…"));
+    m_archiveInfoLabel->setText(QStringLiteral("正在读取压缩包…"));
+    m_formatBadge->setText(QStringLiteral("…"));
     m_archiveTree->clear();
     m_entries.clear();
     m_formatName.clear();
+    m_filterEdit->clear();
+    m_emptyTitle->setText(QStringLiteral("正在读取压缩包…"));
+    m_emptyHint->setText(QDir::toNativeSeparators(m_archivePath));
+    m_archiveStack->setCurrentWidget(m_emptyPage);
     m_tabs->setCurrentWidget(m_archivePage);
-    setWindowTitle(QStringLiteral("StarZip 0.0.1 — %1").arg(archiveDisplayName(m_archivePath)));
+    m_statusFormatLabel->setText(QStringLiteral("格式：读取中"));
+    m_statusCountLabel->setText(QStringLiteral("条目：—"));
+    setWindowTitle(QStringLiteral("StarZip 0.0.2 — %1").arg(archiveDisplayName(m_archivePath)));
     appendLog(QStringLiteral("打开压缩包：%1").arg(QDir::toNativeSeparators(m_archivePath)));
 
     const QString archivePath = m_archivePath;
     if (!beginJob(ArchiveWorker::List, QStringLiteral("正在识别压缩包…"), true,
-                  [archivePath](ArchiveWorker *worker) { worker->listArchive(archivePath); })) {
-        return;
+                  [archivePath, password](ArchiveWorker *worker) {
+                      worker->listArchive(archivePath, password);
+                  })) {
+        resetArchiveState();
     }
 }
 
@@ -498,20 +1002,20 @@ void MainWindow::extractHere()
 {
     if (m_archivePath.isEmpty()) {
         QMessageBox::information(this, QStringLiteral("尚未打开压缩包"),
-                                 QStringLiteral("请先拖入压缩包，或点击“选择文件…”。"));
+                                 QStringLiteral("请先打开压缩包，或把压缩包拖到窗口中。"));
         return;
     }
     QString destination = m_targetEdit->text().trimmed();
     if (destination.isEmpty())
         destination = QDir::currentPath();
-    startExtraction(destination);
+    startExtraction(destination, QStringList(), m_archivePassword);
 }
 
 void MainWindow::extractToChosen()
 {
     if (m_archivePath.isEmpty()) {
         QMessageBox::information(this, QStringLiteral("尚未打开压缩包"),
-                                 QStringLiteral("请先拖入压缩包，或点击“选择文件…”。"));
+                                 QStringLiteral("请先打开压缩包，或把压缩包拖到窗口中。"));
         return;
     }
     if (m_busy)
@@ -523,10 +1027,40 @@ void MainWindow::extractToChosen()
         return;
     m_extractTarget = QDir(dir).absolutePath();
     m_targetEdit->setText(QDir::toNativeSeparators(m_extractTarget));
-    startExtraction(m_extractTarget);
+    startExtraction(m_extractTarget, QStringList(), m_archivePassword);
 }
 
-void MainWindow::startExtraction(const QString &destination)
+void MainWindow::extractSelected()
+{
+    if (m_archivePath.isEmpty()) {
+        QMessageBox::information(this, QStringLiteral("尚未打开压缩包"),
+                                 QStringLiteral("请先打开压缩包。"));
+        return;
+    }
+    const QStringList paths = selectedArchivePaths();
+    if (paths.isEmpty()) {
+        QMessageBox::information(this, QStringLiteral("未选择条目"),
+                                 QStringLiteral("请先在列表中选择要解压的文件或文件夹。"));
+        return;
+    }
+    QString destination = m_targetEdit->text().trimmed();
+    if (destination.isEmpty())
+        destination = QDir::currentPath();
+    startExtraction(destination, paths, m_archivePassword);
+}
+
+void MainWindow::testArchive()
+{
+    if (m_archivePath.isEmpty()) {
+        QMessageBox::information(this, QStringLiteral("尚未打开压缩包"),
+                                 QStringLiteral("请先打开压缩包。"));
+        return;
+    }
+    startTest(m_archivePassword);
+}
+
+void MainWindow::startExtraction(const QString &destination, const QStringList &onlyPaths,
+                                 const QString &password, bool retry)
 {
     if (m_archivePath.isEmpty()) {
         QMessageBox::information(this, QStringLiteral("尚未打开压缩包"),
@@ -549,18 +1083,72 @@ void MainWindow::startExtraction(const QString &destination)
         return;
     }
 
+    if (!retry) {
+        m_passwordAttempts = 0;
+        m_passwordSignal = false;
+    }
+
+    QString effectivePassword = password;
+    if (effectivePassword.isEmpty() && archiveHasEncryptedEntries()) {
+        effectivePassword = promptPassword(
+            QStringLiteral("加密压缩包"),
+            QStringLiteral("该压缩包包含加密条目，请输入密码（留空则取消）："));
+        if (effectivePassword.isEmpty()) {
+            statusBar()->showMessage(QStringLiteral("已取消：需要密码才能解压。"), 6000);
+            return;
+        }
+    }
+    if (!effectivePassword.isEmpty())
+        m_archivePassword = effectivePassword;
+
     m_extractTarget = QDir(target).absolutePath();
     m_targetEdit->setText(QDir::toNativeSeparators(m_extractTarget));
+    m_lastExtractDest = m_extractTarget;
+    m_lastExtractOnly = onlyPaths;
+
     const QString archivePath = m_archivePath;
     const QString destinationDir = m_extractTarget;
-
-    appendLog(QStringLiteral("开始解压：%1 → %2")
+    appendLog(QStringLiteral("开始解压：%1 → %2%3")
                   .arg(QDir::toNativeSeparators(archivePath),
-                       QDir::toNativeSeparators(destinationDir)));
+                       QDir::toNativeSeparators(destinationDir),
+                       onlyPaths.isEmpty()
+                           ? QString()
+                           : QStringLiteral("（选中 %1 项）").arg(onlyPaths.size())));
 
     beginJob(ArchiveWorker::Extract, QStringLiteral("正在解压…"), false,
-             [archivePath, destinationDir](ArchiveWorker *worker) {
-                 worker->extractArchive(archivePath, destinationDir);
+             [archivePath, destinationDir, effectivePassword, onlyPaths](ArchiveWorker *worker) {
+                 worker->extractArchive(archivePath, destinationDir, effectivePassword, onlyPaths);
+             });
+}
+
+void MainWindow::startTest(const QString &password, bool retry)
+{
+    if (m_archivePath.isEmpty() || m_busy)
+        return;
+    if (!retry) {
+        m_passwordAttempts = 0;
+        m_passwordSignal = false;
+    }
+
+    QString effectivePassword = password;
+    if (effectivePassword.isEmpty() && archiveHasEncryptedEntries()) {
+        effectivePassword = promptPassword(
+            QStringLiteral("加密压缩包"),
+            QStringLiteral("测试加密压缩包需要密码，请输入："));
+        if (effectivePassword.isEmpty()) {
+            statusBar()->showMessage(QStringLiteral("已取消：需要密码才能测试。"), 6000);
+            return;
+        }
+    }
+    if (!effectivePassword.isEmpty())
+        m_archivePassword = effectivePassword;
+
+    const QString archivePath = m_archivePath;
+    appendLog(QStringLiteral("开始测试压缩包：%1")
+                  .arg(QDir::toNativeSeparators(archivePath)));
+    beginJob(ArchiveWorker::Test, QStringLiteral("正在校验压缩包…"), false,
+             [archivePath, effectivePassword](ArchiveWorker *worker) {
+                 worker->testArchive(archivePath, effectivePassword);
              });
 }
 
@@ -568,47 +1156,48 @@ void MainWindow::addFiles()
 {
     if (m_busy)
         return;
+    QString startDir = QDir::homePath();
+    if (m_sourcesTree->topLevelItemCount() > 0) {
+        startDir = QFileInfo(m_sourcesTree->topLevelItem(0)
+                                 ->data(0, Qt::UserRole)
+                                 .toString())
+                       .absolutePath();
+    }
     const QStringList files = QFileDialog::getOpenFileNames(
-        this, QStringLiteral("选择要压缩的文件"),
-        m_sourcesTree->topLevelItemCount() > 0
-            ? QFileInfo(m_sourcesTree->topLevelItem(0)
-                            ->data(0, Qt::UserRole)
-                            .toString())
-                  .absolutePath()
-            : QDir::homePath(),
-        QStringLiteral("所有文件 (*.*)"));
+        this, QStringLiteral("选择要压缩的文件"), startDir, QStringLiteral("所有文件 (*.*)"));
     for (const QString &file : files)
         addSourcePath(file);
     refreshSourcesSummary();
     if (!files.isEmpty())
-        m_tabs->setCurrentWidget(m_sourcesPage);
+        m_tabs->setCurrentWidget(m_compressPage);
 }
 
 void MainWindow::addFolder()
 {
     if (m_busy)
         return;
+    QString startDir = QDir::homePath();
+    if (m_sourcesTree->topLevelItemCount() > 0) {
+        startDir = QFileInfo(m_sourcesTree->topLevelItem(0)
+                                 ->data(0, Qt::UserRole)
+                                 .toString())
+                       .absolutePath();
+    }
     const QString folder = QFileDialog::getExistingDirectory(
-        this, QStringLiteral("选择要压缩的文件夹"),
-        m_sourcesTree->topLevelItemCount() > 0
-            ? QFileInfo(m_sourcesTree->topLevelItem(0)
-                            ->data(0, Qt::UserRole)
-                            .toString())
-                  .absolutePath()
-            : QDir::homePath());
+        this, QStringLiteral("选择要压缩的文件夹"), startDir);
     if (folder.isEmpty())
         return;
     addSourcePath(folder);
     refreshSourcesSummary();
-    m_tabs->setCurrentWidget(m_sourcesPage);
+    m_tabs->setCurrentWidget(m_compressPage);
 }
 
 void MainWindow::addSourcePath(const QString &path)
 {
     const QFileInfo info(path);
     if (!info.exists()) {
-        showError(QStringLiteral("无法添加"), QStringLiteral("路径不存在：\n%1")
-                                                .arg(QDir::toNativeSeparators(path)));
+        showError(QStringLiteral("无法添加"),
+                  QStringLiteral("路径不存在：\n%1").arg(QDir::toNativeSeparators(path)));
         return;
     }
     const QString absolute = info.absoluteFilePath();
@@ -622,13 +1211,12 @@ void MainWindow::addSourcePath(const QString &path)
     auto *item = new QTreeWidgetItem(m_sourcesTree);
     item->setText(0, info.fileName().isEmpty() ? absolute : info.fileName());
     item->setText(1, info.isDir() ? QStringLiteral("文件夹") : QStringLiteral("文件"));
-    item->setText(2, QDir::toNativeSeparators(absolute));
+    item->setText(2, info.isDir() ? QStringLiteral("—") : humanSize(info.size()));
+    item->setText(3, QDir::toNativeSeparators(absolute));
     item->setData(0, Qt::UserRole, absolute);
-    item->setToolTip(2, QDir::toNativeSeparators(absolute));
-    if (info.isDir())
-        item->setIcon(0, style()->standardIcon(QStyle::SP_DirIcon));
-    else
-        item->setIcon(0, style()->standardIcon(QStyle::SP_FileIcon));
+    item->setToolTip(3, QDir::toNativeSeparators(absolute));
+    item->setIcon(0, style()->standardIcon(info.isDir() ? QStyle::SP_DirIcon
+                                                        : QStyle::SP_FileIcon));
 }
 
 void MainWindow::removeSelectedSources()
@@ -649,7 +1237,122 @@ void MainWindow::clearSources()
     refreshSourcesSummary();
 }
 
-void MainWindow::createZip()
+QString MainWindow::currentFormat() const
+{
+    return m_formatCombo ? m_formatCombo->currentData().toString() : QStringLiteral("zip");
+}
+
+MainWindow::FormatChoice MainWindow::currentFormatChoice() const
+{
+    const QString id = currentFormat();
+    for (const FormatChoice &choice : formatChoices()) {
+        if (choice.id == id)
+            return choice;
+    }
+    return formatChoices().first();
+}
+
+QVector<MainWindow::FormatChoice> MainWindow::formatChoices()
+{
+    return {
+        {QStringLiteral("zip"), QStringLiteral("ZIP（.zip）"), QStringLiteral(".zip"),
+         QStringLiteral("ZIP 压缩包 (*.zip)"), true, true},
+        {QStringLiteral("7z"), QStringLiteral("7Z（.7z）"), QStringLiteral(".7z"),
+         QStringLiteral("7Z 压缩包 (*.7z)"), false, true},
+        {QStringLiteral("tar"), QStringLiteral("TAR（.tar）"), QStringLiteral(".tar"),
+         QStringLiteral("TAR 归档 (*.tar)"), false, false},
+        {QStringLiteral("tar.gz"), QStringLiteral("TAR.GZ（.tar.gz）"), QStringLiteral(".tar.gz"),
+         QStringLiteral("TAR.GZ 压缩包 (*.tar.gz)"), false, true},
+        {QStringLiteral("tar.xz"), QStringLiteral("TAR.XZ（.tar.xz）"), QStringLiteral(".tar.xz"),
+         QStringLiteral("TAR.XZ 压缩包 (*.tar.xz)"), false, true},
+    };
+}
+
+QString MainWindow::ensureSuffix(const QString &path, const QString &suffix)
+{
+    if (path.endsWith(suffix, Qt::CaseInsensitive))
+        return path;
+    return path + suffix;
+}
+
+QString MainWindow::replaceSuffix(const QString &path, const QString &suffix)
+{
+    if (path.isEmpty())
+        return path;
+    static const QStringList known = {QStringLiteral(".tar.gz"), QStringLiteral(".tar.xz"),
+                                      QStringLiteral(".zip"), QStringLiteral(".7z"),
+                                      QStringLiteral(".tar")};
+    QString base = path;
+    for (const QString &ending : known) {
+        if (base.endsWith(ending, Qt::CaseInsensitive)) {
+            base.chop(ending.size());
+            break;
+        }
+    }
+    return base + suffix;
+}
+
+void MainWindow::onFormatChanged()
+{
+    if (!m_formatCombo || !m_passwordEdit)
+        return;
+    const FormatChoice choice = currentFormatChoice();
+    m_passwordEdit->setEnabled(choice.supportsPassword && !m_busy);
+    m_showPasswordCheck->setEnabled(choice.supportsPassword && !m_busy);
+    m_levelCombo->setEnabled(choice.supportsLevel && !m_busy);
+
+    if (choice.id == QStringLiteral("zip")) {
+        m_passwordNote->setText(QStringLiteral("ZIP 支持 AES-256 密码；如果运行库不支持，"
+                                               "会自动回退到 ZipCrypto。"));
+    } else if (choice.id == QStringLiteral("7z")) {
+        m_passwordNote->setText(QStringLiteral("7Z 写入暂不支持密码；如需密码请选择 ZIP。"));
+    } else {
+        m_passwordNote->setText(QStringLiteral("TAR 系列不支持密码，适合跨平台归档。"));
+    }
+
+    if (!m_outputEdit->text().isEmpty()) {
+        const QString updated = replaceSuffix(m_outputEdit->text(), choice.suffix);
+        if (updated != m_outputEdit->text())
+            m_outputEdit->setText(updated);
+    }
+    updateSuggestedOutput();
+    refreshSourcesSummary();
+}
+
+void MainWindow::togglePasswordVisible(bool visible)
+{
+    m_passwordEdit->setEchoMode(visible ? QLineEdit::Normal : QLineEdit::Password);
+}
+
+void MainWindow::browseOutput()
+{
+    const FormatChoice choice = currentFormatChoice();
+    QString initial = m_outputEdit->text().trimmed();
+    if (initial.isEmpty()) {
+        const QStringList sources = selectedSources();
+        QString base = QStringLiteral("StarZip_%1")
+                           .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss")));
+        QString dir = QDir::homePath();
+        if (!sources.isEmpty()) {
+            const QFileInfo first(sources.first());
+            dir = first.isDir() ? first.absolutePath() : first.absolutePath();
+            if (sources.size() == 1) {
+                const QString name = first.isDir() ? first.fileName() : first.completeBaseName();
+                if (!name.isEmpty())
+                    base = name;
+            }
+        }
+        initial = QDir(dir).filePath(base + choice.suffix);
+    }
+    const QString path = QFileDialog::getSaveFileName(this, QStringLiteral("保存压缩包"), initial,
+                                                      choice.dialogFilter);
+    if (path.isEmpty())
+        return;
+    m_outputEdit->setText(ensureSuffix(path, choice.suffix));
+    m_outputEdit->setToolTip(QDir::toNativeSeparators(m_outputEdit->text()));
+}
+
+void MainWindow::createArchive()
 {
     if (m_busy) {
         statusBar()->showMessage(QStringLiteral("当前有任务正在进行，请稍候。"), 4000);
@@ -659,32 +1362,436 @@ void MainWindow::createZip()
     if (sources.isEmpty()) {
         QMessageBox::information(this, QStringLiteral("没有待压缩内容"),
                                  QStringLiteral("请先添加要压缩的文件或文件夹。"));
+        m_tabs->setCurrentWidget(m_compressPage);
         return;
     }
 
-    const QFileInfo first(sources.first());
-    const QString baseName = sources.size() == 1 && !first.completeBaseName().isEmpty()
-                                 ? first.completeBaseName()
-                                 : QStringLiteral("StarZip_%1")
-                                       .arg(QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss"));
-    QString suggested = QDir(first.absolutePath()).filePath(baseName + QStringLiteral(".zip"));
+    const FormatChoice choice = currentFormatChoice();
+    const QString password = choice.supportsPassword ? m_passwordEdit->text() : QString();
 
-    QString zipPath = QFileDialog::getSaveFileName(
-        this, QStringLiteral("保存 ZIP 压缩包"), suggested,
-        QStringLiteral("ZIP 压缩包 (*.zip)"));
-    if (zipPath.isEmpty())
-        return;
-    if (!zipPath.endsWith(QStringLiteral(".zip"), Qt::CaseInsensitive))
-        zipPath += QStringLiteral(".zip");
+    QString output = m_outputEdit->text().trimmed();
+    if (output.isEmpty()) {
+        browseOutput();
+        output = m_outputEdit->text().trimmed();
+        if (output.isEmpty())
+            return;
+    }
+    output = ensureSuffix(output, choice.suffix);
+    m_outputEdit->setText(output);
 
-    appendLog(QStringLiteral("开始压缩 %1 个源项目 → %2")
+    if (QFileInfo::exists(output)) {
+        const QMessageBox::StandardButton answer = QMessageBox::question(
+            this, QStringLiteral("覆盖文件"),
+            QStringLiteral("输出文件已存在，是否覆盖？\n%1")
+                .arg(QDir::toNativeSeparators(output)),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (answer != QMessageBox::Yes) {
+            statusBar()->showMessage(QStringLiteral("已取消压缩。"), 4000);
+            return;
+        }
+    }
+
+    CompressOptions options;
+    options.format = choice.id;
+    options.level = m_levelCombo->currentData().toInt();
+    options.password = password;
+
+    appendLog(QStringLiteral("开始压缩 %1 个源项目 → %2（格式 %3%4）")
                   .arg(sources.size())
-                  .arg(QDir::toNativeSeparators(zipPath)));
-
+                  .arg(QDir::toNativeSeparators(output), choice.label,
+                       password.isEmpty() ? QString()
+                                          : QStringLiteral("，已启用密码")));
     beginJob(ArchiveWorker::Compress, QStringLiteral("正在准备压缩…"), false,
-             [sources, zipPath](ArchiveWorker *worker) {
-                 worker->compressToZip(sources, zipPath);
+             [sources, output, options](ArchiveWorker *worker) {
+                 worker->compressArchive(sources, output, options);
              });
+}
+
+void MainWindow::startNewArchive()
+{
+    if (m_busy)
+        return;
+    m_tabs->setCurrentWidget(m_compressPage);
+    if (m_sourcesTree->topLevelItemCount() == 0)
+        addFiles();
+}
+
+void MainWindow::refreshSourcesSummary()
+{
+    const int count = m_sourcesTree->topLevelItemCount();
+    if (m_createArchiveButton) {
+        m_createArchiveButton->setText(count > 0
+                                          ? QStringLiteral("开始压缩（%1 项）").arg(count)
+                                          : QStringLiteral("开始压缩"));
+    }
+    updateSuggestedOutput();
+    updateActions();
+}
+
+void MainWindow::updateSuggestedOutput()
+{
+    if (!m_outputEdit)
+        return;
+    if (!m_outputEdit->text().trimmed().isEmpty())
+        return;
+    const FormatChoice choice = currentFormatChoice();
+    const QStringList sources = selectedSources();
+    if (sources.isEmpty()) {
+        m_outputEdit->setPlaceholderText(QStringLiteral("留空会在压缩时询问保存位置"));
+        return;
+    }
+    const QFileInfo first(sources.first());
+    QString base = QStringLiteral("StarZip_%1")
+                       .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss")));
+    if (sources.size() == 1) {
+        const QString name = first.isDir() ? first.fileName() : first.completeBaseName();
+        if (!name.isEmpty())
+            base = name;
+    }
+    const QString dir = first.isDir() ? first.absolutePath() : first.absolutePath();
+    m_outputEdit->setPlaceholderText(
+        QStringLiteral("留空则使用：%1")
+            .arg(QDir::toNativeSeparators(QDir(dir).filePath(base + choice.suffix))));
+}
+
+QStringList MainWindow::selectedSources() const
+{
+    QStringList paths;
+    for (int i = 0; i < m_sourcesTree->topLevelItemCount(); ++i) {
+        const QTreeWidgetItem *item = m_sourcesTree->topLevelItem(i);
+        const QString path = item->data(0, Qt::UserRole).toString();
+        if (!path.isEmpty())
+            paths.append(path);
+    }
+    return paths;
+}
+
+void MainWindow::fillArchiveTree(const QVector<ArchiveEntry> &entries)
+{
+    m_archiveTree->setUpdatesEnabled(false);
+    m_archiveTree->clear();
+
+    QVector<ArchiveEntry> sorted = entries;
+    std::sort(sorted.begin(), sorted.end(), [](const ArchiveEntry &a, const ArchiveEntry &b) {
+        return a.path.compare(b.path, Qt::CaseInsensitive) < 0;
+    });
+
+    const QIcon dirIcon = style()->standardIcon(QStyle::SP_DirIcon);
+    const QIcon fileIcon = style()->standardIcon(QStyle::SP_FileIcon);
+    QHash<QString, QTreeWidgetItem *> dirItems;
+
+    std::function<QTreeWidgetItem *(const QString &)> ensureDir;
+    ensureDir = [&](const QString &dirPath) -> QTreeWidgetItem * {
+        const QString key = dirPath.toCaseFolded();
+        auto found = dirItems.find(key);
+        if (found != dirItems.end())
+            return found.value();
+        const int slash = dirPath.lastIndexOf(QLatin1Char('/'));
+        QTreeWidgetItem *parent = nullptr;
+        const QString name = slash >= 0 ? dirPath.mid(slash + 1) : dirPath;
+        if (slash >= 0)
+            parent = ensureDir(dirPath.left(slash));
+        auto *item = parent ? new QTreeWidgetItem(parent) : new QTreeWidgetItem(m_archiveTree);
+        item->setText(0, name);
+        item->setIcon(0, dirIcon);
+        item->setText(2, QStringLiteral("文件夹"));
+        item->setData(0, Qt::UserRole, dirPath);
+        dirItems.insert(key, item);
+        return item;
+    };
+
+    for (const ArchiveEntry &entry : sorted) {
+        QString path = entry.path;
+        path.replace(QLatin1Char('\\'), QLatin1Char('/'));
+        while (path.endsWith(QLatin1Char('/')))
+            path.chop(1);
+        if (path.isEmpty())
+            continue;
+
+        const QString modified = entry.modified.isValid()
+                                     ? entry.modified.toString(QStringLiteral("yyyy-MM-dd HH:mm"))
+                                     : QStringLiteral("—");
+
+        QTreeWidgetItem *item = nullptr;
+        if (entry.isDir) {
+            item = ensureDir(path);
+            item->setText(2, QStringLiteral("文件夹"));
+        } else {
+            const int slash = path.lastIndexOf(QLatin1Char('/'));
+            const QString name = slash >= 0 ? path.mid(slash + 1) : path;
+            QTreeWidgetItem *parent = slash >= 0 ? ensureDir(path.left(slash)) : nullptr;
+            item = parent ? new QTreeWidgetItem(parent) : new QTreeWidgetItem(m_archiveTree);
+            item->setText(0, name);
+            item->setIcon(0, fileIcon);
+            item->setText(1, humanSize(entry.size));
+            item->setText(2, QStringLiteral("文件"));
+            item->setData(0, Qt::UserRole, path);
+        }
+
+        item->setData(0, Qt::UserRole + 1, entry.isDir);
+        item->setText(3, modified);
+        item->setText(4, entry.encrypted ? QStringLiteral("加密") : QString());
+        item->setToolTip(0, path);
+        if (entry.encrypted) {
+            item->setForeground(4, QBrush(QColor(QStringLiteral("#b45309"))));
+            item->setToolTip(4, QStringLiteral("该条目已加密，解压时需要密码"));
+        }
+        if (entry.isDir)
+            item->setText(1, QStringLiteral("—"));
+    }
+
+    m_archiveTree->expandToDepth(0);
+    m_archiveTree->setUpdatesEnabled(true);
+    if (!m_filterEdit->text().isEmpty())
+        filterArchiveEntries(m_filterEdit->text());
+}
+
+bool MainWindow::filterTreeItem(QTreeWidgetItem *item, const QString &needle)
+{
+    bool childVisible = false;
+    for (int i = 0; i < item->childCount(); ++i)
+        childVisible = filterTreeItem(item->child(i), needle) || childVisible;
+
+    const bool selfMatch = needle.isEmpty()
+                           || item->text(0).contains(needle, Qt::CaseInsensitive);
+    const bool visible = needle.isEmpty() || selfMatch || childVisible;
+    item->setHidden(!visible);
+    if (!needle.isEmpty() && childVisible)
+        item->setExpanded(true);
+    return visible;
+}
+
+void MainWindow::filterArchiveEntries(const QString &text)
+{
+    const QString needle = text.trimmed();
+    for (int i = 0; i < m_archiveTree->topLevelItemCount(); ++i)
+        filterTreeItem(m_archiveTree->topLevelItem(i), needle);
+}
+
+void MainWindow::showArchiveContextMenu(const QPoint &pos)
+{
+    QTreeWidgetItem *item = m_archiveTree->itemAt(pos);
+    if (item && !item->isSelected()) {
+        m_archiveTree->clearSelection();
+        item->setSelected(true);
+        m_archiveTree->setCurrentItem(item);
+    }
+
+    QMenu menu(this);
+    QAction *extract = menu.addAction(QStringLiteral("解压选中项到当前目标…"));
+    QAction *test = menu.addAction(QStringLiteral("测试压缩包"));
+    menu.addSeparator();
+    QAction *copy = menu.addAction(QStringLiteral("复制条目路径"));
+    extract->setEnabled(!m_busy && m_archiveTree->selectedItems().size() > 0);
+    test->setEnabled(!m_busy && !m_archivePath.isEmpty());
+    copy->setEnabled(m_archiveTree->selectedItems().size() > 0);
+    QAction *chosen = menu.exec(m_archiveTree->viewport()->mapToGlobal(pos));
+
+    if (chosen == extract) {
+        extractSelected();
+    } else if (chosen == test) {
+        testArchive();
+    } else if (chosen == copy) {
+        const QStringList paths = selectedArchivePaths();
+        if (!paths.isEmpty())
+            QApplication::clipboard()->setText(paths.join(QLatin1Char('\n')));
+    }
+}
+
+QStringList MainWindow::selectedArchivePaths() const
+{
+    QStringList paths;
+    for (QTreeWidgetItem *item : m_archiveTree->selectedItems()) {
+        const QString path = item->data(0, Qt::UserRole).toString();
+        if (!path.isEmpty())
+            paths.append(path);
+    }
+    paths.removeDuplicates();
+    return paths;
+}
+
+bool MainWindow::archiveHasEncryptedEntries() const
+{
+    for (const ArchiveEntry &entry : m_entries) {
+        if (entry.encrypted)
+            return true;
+    }
+    return false;
+}
+
+void MainWindow::onArchiveSelectionChanged()
+{
+    updateActions();
+}
+
+void MainWindow::showLogTab()
+{
+    m_tabs->setCurrentWidget(m_logPage);
+}
+
+void MainWindow::showAbout()
+{
+    QMessageBox box(this);
+    box.setWindowTitle(QStringLiteral("关于 StarZip"));
+    box.setIcon(QMessageBox::Information);
+    box.setTextFormat(Qt::RichText);
+    box.setText(QStringLiteral(
+        "<h3>StarZip 0.0.2</h3>"
+        "<p>C++17 · Qt 6 Widgets · libarchive</p>"
+        "<p>读取：ZIP / 7Z / RAR / RAR5 / TAR / GZ / XZ / CAB / ISO<br>"
+        "创建：ZIP / 7Z / TAR / TAR.GZ / TAR.XZ<br>"
+        "密码：ZIP AES-256 写入；加密包读取时可输入密码</p>"
+        "<p>GitHub：<a href='https://github.com/wbzmm2025/StarZip'>"
+        "github.com/wbzmm2025/StarZip</a></p>"
+        "<p style='color:#6b7280'>0.0.1 源码已开源；0.0.2 增加多格式压缩、密码与全新界面。</p>"));
+    box.setStandardButtons(QMessageBox::Ok);
+    box.exec();
+}
+
+void MainWindow::onWorkerProgress(int percent, const QString &detail)
+{
+    if (!m_busy)
+        return;
+    if (m_progressBar->maximum() == 0)
+        m_progressBar->setRange(0, 100);
+    m_progressBar->setValue(qBound(0, percent, 100));
+    m_progressLabel->setText(detail);
+    statusBar()->showMessage(detail);
+}
+
+void MainWindow::onPasswordRequired(int operation, const QString &archivePath)
+{
+    Q_UNUSED(operation)
+    Q_UNUSED(archivePath)
+    m_passwordSignal = true;
+    appendLog(QStringLiteral("压缩包需要密码或密码不正确，等待输入。"));
+    if (m_busy) {
+        m_progressLabel->setText(QStringLiteral("等待输入密码…"));
+        statusBar()->showMessage(QStringLiteral("压缩包已加密，等待输入密码…"));
+    }
+}
+
+void MainWindow::onArchiveListed(const QVector<ArchiveEntry> &entries,
+                                 const QString &formatName, qint64 totalBytes, int entryCount,
+                                 bool truncated)
+{
+    m_entries = entries;
+    m_formatName = formatName.isEmpty() ? QStringLiteral("未知格式") : formatName;
+    fillArchiveTree(entries);
+    updateArchiveHeader(m_formatName, totalBytes, entryCount, truncated);
+    m_archiveStack->setCurrentWidget(m_contentPage);
+    m_emptyTitle->setText(QStringLiteral("打开或拖入一个压缩包"));
+    m_emptyHint->setText(QStringLiteral("支持从本地浏览选择，也可以直接把压缩包拖到窗口。\n"
+                                        "ZIP / 7Z / RAR 的解压、列表、进度与密码提示保持一致。"));
+    m_emptyFormats->setText(
+        QStringLiteral("ZIP · 7Z · RAR · RAR5 · TAR · GZ · XZ · CAB · ISO"));
+    m_tabs->setCurrentWidget(m_archivePage);
+    addRecentFile(m_archivePath);
+    updateStatusInfo();
+
+    QString log = QStringLiteral("识别完成：格式 %1，%2 个条目，解压后 %3%4")
+                      .arg(m_formatName)
+                      .arg(entryCount)
+                      .arg(humanSize(totalBytes))
+                      .arg(truncated ? QStringLiteral("（列表已截断）") : QString());
+    if (archiveHasEncryptedEntries())
+        log += QStringLiteral("；包含加密条目，解压时需要密码。");
+    appendLog(log);
+}
+
+void MainWindow::onWorkerFinished(int operation, bool success, bool canceled,
+                                  const QString &message, int errorCode,
+                                  const QString &outputPath)
+{
+    const bool passwordIssue = m_passwordSignal;
+    m_passwordSignal = false;
+    m_busy = false;
+    cleanupThread();
+    m_worker.clear();
+    m_progressBar->setRange(0, 100);
+    m_cancelButton->setEnabled(false);
+    m_cancelAction->setEnabled(false);
+
+    if (canceled) {
+        m_progressBar->setValue(0);
+        m_progressLabel->setText(QStringLiteral("已取消"));
+        if (operation == ArchiveWorker::List)
+            resetArchiveState();
+        statusBar()->showMessage(QStringLiteral("操作已取消。"), 6000);
+        appendLog(QStringLiteral("操作已取消。"));
+        updateActions();
+        return;
+    }
+
+    if (!success) {
+        m_progressBar->setValue(0);
+        if (errorCode != 0)
+            appendLog(QStringLiteral("错误码：%1").arg(errorCode));
+        appendLog(message);
+
+        if (passwordIssue) {
+            if (m_passwordAttempts >= 3) {
+                showError(QStringLiteral("密码错误"),
+                          message + QStringLiteral("\n\n已连续尝试 3 次。"));
+                if (operation == ArchiveWorker::List)
+                    resetArchiveState();
+                updateActions();
+                return;
+            }
+            const QString password = promptPassword(
+                QStringLiteral("需要密码"),
+                QStringLiteral("该压缩包已加密，或上次输入的密码不正确。\n"
+                               "请输入密码后重试："));
+            if (!password.isEmpty()) {
+                ++m_passwordAttempts;
+                m_archivePassword = password;
+                if (operation == ArchiveWorker::List) {
+                    const QString path = m_archivePath;
+                    openArchive(path, password, true);
+                } else if (operation == ArchiveWorker::Extract) {
+                    startExtraction(m_lastExtractDest, m_lastExtractOnly, password, true);
+                } else if (operation == ArchiveWorker::Test) {
+                    startTest(password, true);
+                }
+                updateActions();
+                return;
+            }
+            statusBar()->showMessage(QStringLiteral("已取消密码输入。"), 6000);
+            appendLog(QStringLiteral("用户取消了密码输入。"));
+            m_progressLabel->setText(QStringLiteral("已取消"));
+            if (operation == ArchiveWorker::List)
+                resetArchiveState();
+            updateActions();
+            return;
+        }
+
+        if (operation == ArchiveWorker::List) {
+            resetArchiveState();
+            m_progressLabel->setText(QStringLiteral("失败"));
+        }
+        showError(operationLabel(operation) + QStringLiteral("失败"), message);
+        updateActions();
+        return;
+    }
+
+    m_passwordAttempts = 0;
+
+    if (operation == ArchiveWorker::List) {
+        statusBar()->showMessage(message, 8000);
+        m_progressLabel->setText(QStringLiteral("就绪"));
+        appendLog(message);
+    } else {
+        m_progressBar->setValue(100);
+        m_progressLabel->setText(QStringLiteral("完成"));
+        appendLog(message);
+        QString folder;
+        if (operation == ArchiveWorker::Extract)
+            folder = outputPath;
+        else if (operation == ArchiveWorker::Compress)
+            folder = QFileInfo(outputPath).absolutePath();
+        showSuccess(operationLabel(operation) + QStringLiteral("成功"), message, folder);
+    }
+    updateActions();
 }
 
 bool MainWindow::beginJob(ArchiveWorker::Operation operation, const QString &busyText,
@@ -699,6 +1806,7 @@ bool MainWindow::beginJob(ArchiveWorker::Operation operation, const QString &bus
     }
 
     m_busy = true;
+    m_passwordSignal = false;
     m_currentOperation = operation;
     m_progressBar->setRange(0, indeterminate ? 0 : 100);
     m_progressBar->setValue(0);
@@ -718,6 +1826,8 @@ bool MainWindow::beginJob(ArchiveWorker::Operation operation, const QString &bus
             Qt::QueuedConnection);
     connect(worker, &ArchiveWorker::listed, this, &MainWindow::onArchiveListed,
             Qt::QueuedConnection);
+    connect(worker, &ArchiveWorker::passwordRequired, this, &MainWindow::onPasswordRequired,
+            Qt::QueuedConnection);
     connect(worker, &ArchiveWorker::finished, this, &MainWindow::onWorkerFinished,
             Qt::QueuedConnection);
     connect(worker, &ArchiveWorker::finished, thread, &QThread::quit);
@@ -728,120 +1838,150 @@ bool MainWindow::beginJob(ArchiveWorker::Operation operation, const QString &bus
     return true;
 }
 
-void MainWindow::onWorkerProgress(int percent, const QString &detail)
+void MainWindow::cleanupThread()
 {
-    if (!m_busy)
-        return;
-    if (m_progressBar->maximum() == 0)
-        m_progressBar->setRange(0, 100);
-    m_progressBar->setValue(qBound(0, percent, 100));
-    m_progressLabel->setText(detail);
-    statusBar()->showMessage(detail);
+    if (m_thread && m_thread->isRunning()) {
+        m_thread->quit();
+        m_thread->wait(5000);
+    }
 }
 
-void MainWindow::onArchiveListed(const QVector<ArchiveEntry> &entries,
-                                const QString &formatName, qint64 totalBytes, int entryCount,
-                                bool truncated)
+void MainWindow::resetArchiveState()
 {
-    m_entries = entries;
-    m_formatName = formatName.isEmpty() ? QStringLiteral("未知格式") : formatName;
-    fillArchiveTree(entries);
-    updateArchiveHeader(m_formatName, totalBytes, entryCount, truncated);
-    m_tabs->setCurrentWidget(m_archivePage);
-
-    appendLog(QStringLiteral("识别完成：格式 %1，%2 个条目，解压后 %3%4")
-                  .arg(m_formatName)
-                  .arg(entryCount)
-                  .arg(humanSize(totalBytes))
-                  .arg(truncated ? QStringLiteral("（列表已截断）") : QString()));
-}
-
-void MainWindow::onWorkerFinished(int operation, bool success, bool canceled,
-                                  const QString &message, int errorCode,
-                                  const QString &outputPath)
-{
-    Q_UNUSED(outputPath)
-    m_busy = false;
-    m_worker.clear();
-    m_progressBar->setRange(0, 100);
-    m_progressLabel->setText(QStringLiteral("就绪"));
-    m_cancelButton->setEnabled(false);
-
-    if (canceled) {
-        m_progressBar->setValue(0);
-        m_progressLabel->setText(QStringLiteral("已取消"));
-        if (operation == ArchiveWorker::List) {
-            m_archivePath.clear();
-            m_archiveLabel->setText(QStringLiteral("未选择"));
-            m_archiveInfoLabel->setText(QStringLiteral("尚未打开压缩包。"));
-            setWindowTitle(QStringLiteral("StarZip 0.0.1"));
-        }
-        statusBar()->showMessage(QStringLiteral("操作已取消。"), 6000);
-        appendLog(QStringLiteral("操作已取消。"));
-        updateActions();
-        return;
+    m_archivePath.clear();
+    m_archivePassword.clear();
+    m_formatName.clear();
+    m_entries.clear();
+    m_passwordAttempts = 0;
+    m_passwordSignal = false;
+    if (m_archiveTree)
+        m_archiveTree->clear();
+    if (m_archiveStack)
+        m_archiveStack->setCurrentWidget(m_emptyPage);
+    if (m_emptyTitle)
+        m_emptyTitle->setText(QStringLiteral("打开或拖入一个压缩包"));
+    if (m_emptyHint) {
+        m_emptyHint->setText(QStringLiteral("支持从本地浏览选择，也可以直接把压缩包拖到窗口。\n"
+                                            "ZIP / 7Z / RAR 的解压、列表、进度与密码提示保持一致。"));
     }
-
-    if (!success) {
-        m_progressBar->setValue(0);
-        if (operation == ArchiveWorker::List) {
-            m_archivePath.clear();
-            m_archiveLabel->setText(QStringLiteral("未选择"));
-            m_archiveInfoLabel->setText(QStringLiteral("无法读取该文件。"));
-            setWindowTitle(QStringLiteral("StarZip 0.0.1"));
-        }
-        if (errorCode != 0)
-            appendLog(QStringLiteral("错误码：%1").arg(errorCode));
-        showError(operationLabel(operation) + QStringLiteral("失败"), message);
-        refreshSourcesSummary();
-        updateActions();
-        return;
+    if (m_emptyFormats) {
+        m_emptyFormats->setText(
+            QStringLiteral("ZIP · 7Z · RAR · RAR5 · TAR · GZ · XZ · CAB · ISO"));
     }
-
-    if (operation == ArchiveWorker::List) {
-        // 列表成功提示由 onArchiveListed 与状态栏完成，不额外弹出模态框。
-        statusBar()->showMessage(message, 8000);
-        appendLog(message);
-    } else {
-        m_progressBar->setValue(100);
-        m_progressLabel->setText(QStringLiteral("完成"));
-        appendLog(message);
-        showSuccess(operationLabel(operation) + QStringLiteral("成功"), message);
-    }
-    updateActions();
-}
-
-void MainWindow::finishJobUi()
-{
-    m_cancelButton->setEnabled(false);
+    m_archiveLabel->setText(QStringLiteral("未选择"));
+    m_archiveLabel->setToolTip(QString());
+    m_archiveInfoLabel->setText(QStringLiteral("尚未打开压缩包。"));
+    m_formatBadge->setText(QStringLiteral("—"));
+    m_statusFormatLabel->setText(QStringLiteral("格式：—"));
+    m_statusCountLabel->setText(QStringLiteral("条目：—"));
+    setWindowTitle(QStringLiteral("StarZip 0.0.2"));
     updateActions();
 }
 
 void MainWindow::updateActions()
 {
+    // createCompressPage() 会在 setupUi() 仍未完成时触发本函数，
+    // 此时进度栏/取消按钮尚未创建，直接返回避免访问空指针。
+    if (!m_uiReady)
+        return;
     const bool idle = !m_busy;
-    m_selectButton->setEnabled(idle);
+    const bool hasArchive = idle && !m_archivePath.isEmpty();
+    const bool hasSelection = hasArchive && m_archiveTree
+                              && !m_archiveTree->selectedItems().isEmpty();
+    const bool hasSources = m_sourcesTree && m_sourcesTree->topLevelItemCount() > 0;
+
+    m_openAction->setEnabled(idle);
+    m_newAction->setEnabled(idle);
+    m_openButton->setEnabled(idle);
+    m_emptyOpenButton->setEnabled(idle);
+    m_emptyNewButton->setEnabled(idle);
     m_browseTargetButton->setEnabled(idle);
     m_targetEdit->setEnabled(idle);
-    m_extractHereButton->setEnabled(idle && !m_archivePath.isEmpty());
-    m_extractToButton->setEnabled(idle && !m_archivePath.isEmpty());
+    m_extractHereAction->setEnabled(hasArchive);
+    m_extractToAction->setEnabled(hasArchive);
+    m_extractHereButton->setEnabled(hasArchive);
+    m_extractToButton->setEnabled(hasArchive);
+    m_extractSelectedAction->setEnabled(hasSelection);
+    m_extractSelectedButton->setEnabled(hasSelection);
+    m_testAction->setEnabled(hasArchive);
+    m_testButton->setEnabled(hasArchive);
+    m_filterEdit->setEnabled(hasArchive);
+    m_cancelAction->setEnabled(m_busy);
     m_cancelButton->setEnabled(m_busy);
 
-    const bool hasSources = m_sourcesTree->topLevelItemCount() > 0;
+    m_addFilesAction->setEnabled(idle);
+    m_addFolderAction->setEnabled(idle);
     m_addFilesButton->setEnabled(idle);
     m_addFolderButton->setEnabled(idle);
-    m_removeSourceButton->setEnabled(idle && !m_sourcesTree->selectedItems().isEmpty());
+    m_removeSourceButton->setEnabled(idle && m_sourcesTree
+                                     && !m_sourcesTree->selectedItems().isEmpty());
     m_clearSourcesButton->setEnabled(idle && hasSources);
-    m_createZipButton->setEnabled(idle && hasSources);
+    m_compressAction->setEnabled(idle && hasSources);
+    m_createArchiveButton->setEnabled(idle && hasSources);
+    m_formatCombo->setEnabled(idle);
+    m_levelCombo->setEnabled(idle && currentFormatChoice().supportsLevel);
+    m_passwordEdit->setEnabled(idle && currentFormatChoice().supportsPassword);
+    m_showPasswordCheck->setEnabled(idle && currentFormatChoice().supportsPassword);
+    m_outputEdit->setEnabled(idle);
+    m_browseOutputButton->setEnabled(idle);
 }
 
-void MainWindow::setDropZoneActive(bool active)
+void MainWindow::updateStatusInfo()
 {
-    if (m_dropZone->property("dragActive").toBool() == active)
+    QString badge = m_formatName;
+    if (badge.contains(QStringLiteral("7-Zip"), Qt::CaseInsensitive))
+        badge = QStringLiteral("7Z");
+    else if (badge.contains(QStringLiteral("ZIP"), Qt::CaseInsensitive))
+        badge = QStringLiteral("ZIP");
+    else if (badge.contains(QStringLiteral("RAR"), Qt::CaseInsensitive))
+        badge = QStringLiteral("RAR");
+    else if (badge.contains(QStringLiteral("TAR"), Qt::CaseInsensitive))
+        badge = QStringLiteral("TAR");
+    else if (badge.isEmpty())
+        badge = QStringLiteral("—");
+    m_statusFormatLabel->setText(QStringLiteral("格式：%1").arg(badge));
+    m_statusCountLabel->setText(QStringLiteral("条目：%1").arg(m_entries.size()));
+}
+
+void MainWindow::updateArchiveHeader(const QString &formatName, qint64 totalBytes,
+                                     int entryCount, bool truncated)
+{
+    if (formatName.isEmpty()) {
+        m_formatBadge->setText(QStringLiteral("—"));
+        m_archiveInfoLabel->setText(QStringLiteral("尚未打开压缩包。"));
         return;
-    m_dropZone->setProperty("dragActive", active);
-    m_dropZone->style()->unpolish(m_dropZone);
-    m_dropZone->style()->polish(m_dropZone);
+    }
+
+    QString badge = QStringLiteral("ZIP");
+    if (formatName.contains(QStringLiteral("7-Zip"), Qt::CaseInsensitive))
+        badge = QStringLiteral("7Z");
+    else if (formatName.contains(QStringLiteral("RAR"), Qt::CaseInsensitive))
+        badge = QStringLiteral("RAR");
+    else if (formatName.contains(QStringLiteral("TAR"), Qt::CaseInsensitive))
+        badge = QStringLiteral("TAR");
+    else if (formatName.contains(QStringLiteral("ZIP"), Qt::CaseInsensitive))
+        badge = QStringLiteral("ZIP");
+    else
+        badge = formatName.section(QLatin1Char(' '), 0, 0).toUpper();
+    m_formatBadge->setText(badge);
+    m_formatBadge->setToolTip(formatName);
+
+    int encrypted = 0;
+    for (const ArchiveEntry &entry : m_entries) {
+        if (entry.encrypted)
+            ++encrypted;
+    }
+    QString info = QStringLiteral("格式：%1    条目：%2    解压后大小：%3")
+                       .arg(formatName)
+                       .arg(entryCount)
+                       .arg(humanSize(totalBytes));
+    if (encrypted > 0)
+        info += QStringLiteral("    加密条目：%1").arg(encrypted);
+    if (truncated)
+        info += QStringLiteral("    列表仅显示前 20000 项");
+    m_archiveInfoLabel->setText(info);
+    m_statusFormatLabel->setText(QStringLiteral("格式：%1").arg(badge));
+    m_statusCountLabel->setText(QStringLiteral("条目：%1").arg(entryCount));
 }
 
 void MainWindow::appendLog(const QString &text)
@@ -863,7 +2003,8 @@ void MainWindow::showError(const QString &title, const QString &message)
     box.exec();
 }
 
-void MainWindow::showSuccess(const QString &title, const QString &message)
+void MainWindow::showSuccess(const QString &title, const QString &message,
+                             const QString &folderPath)
 {
     statusBar()->showMessage(QStringLiteral("%1：%2").arg(title, firstLine(message)), 10000);
     QMessageBox box(this);
@@ -871,75 +2012,23 @@ void MainWindow::showSuccess(const QString &title, const QString &message)
     box.setWindowTitle(title);
     box.setText(title);
     box.setInformativeText(message);
-    box.setStandardButtons(QMessageBox::Ok);
+    QPushButton *openFolder = nullptr;
+    if (!folderPath.isEmpty())
+        openFolder = box.addButton(QStringLiteral("打开文件夹"), QMessageBox::ActionRole);
+    box.addButton(QMessageBox::Ok);
     box.exec();
+    if (openFolder && box.clickedButton() == openFolder)
+        QDesktopServices::openUrl(QUrl::fromLocalFile(folderPath));
 }
 
-QStringList MainWindow::selectedSources() const
+QString MainWindow::promptPassword(const QString &title, const QString &text)
 {
-    QStringList paths;
-    for (int i = 0; i < m_sourcesTree->topLevelItemCount(); ++i) {
-        const QTreeWidgetItem *item = m_sourcesTree->topLevelItem(i);
-        const QString path = item->data(0, Qt::UserRole).toString();
-        if (!path.isEmpty())
-            paths.append(path);
-    }
-    return paths;
-}
-
-void MainWindow::refreshSourcesSummary()
-{
-    const int count = m_sourcesTree->topLevelItemCount();
-    m_createZipButton->setText(count > 0
-                                   ? QStringLiteral("压缩为 ZIP（%1 项）…").arg(count)
-                                   : QStringLiteral("压缩为 ZIP…"));
-    updateActions();
-}
-
-void MainWindow::fillArchiveTree(const QVector<ArchiveEntry> &entries)
-{
-    m_archiveTree->setUpdatesEnabled(false);
-    m_archiveTree->clear();
-
-    QVector<ArchiveEntry> sorted = entries;
-    std::sort(sorted.begin(), sorted.end(), [](const ArchiveEntry &a, const ArchiveEntry &b) {
-        return a.path.compare(b.path, Qt::CaseInsensitive) < 0;
-    });
-
-    for (const ArchiveEntry &entry : sorted) {
-        auto *item = new QTreeWidgetItem(m_archiveTree);
-        QString name = entry.path;
-        if (entry.encrypted)
-            name += QStringLiteral("  [加密]");
-        item->setText(0, name);
-        item->setIcon(0, style()->standardIcon(entry.isDir ? QStyle::SP_DirIcon
-                                                          : QStyle::SP_FileIcon));
-        item->setText(1, entry.isDir ? QStringLiteral("文件夹") : humanSize(entry.size));
-        item->setText(2, entry.modified.isValid()
-                             ? entry.modified.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"))
-                             : QStringLiteral("—"));
-        if (entry.encrypted)
-            item->setForeground(0, QBrush(QColor(QStringLiteral("#b45309"))));
-        item->setToolTip(0, entry.path);
-    }
-
-    m_archiveTree->setUpdatesEnabled(true);
-}
-
-void MainWindow::updateArchiveHeader(const QString &formatName, qint64 totalBytes,
-                                     int entryCount, bool truncated)
-{
-    QString text = QStringLiteral("格式：%1    条目：%2    解压后大小：%3")
-                       .arg(formatName)
-                       .arg(entryCount)
-                       .arg(humanSize(totalBytes));
-    if (truncated)
-        text += QStringLiteral("    列表仅显示前 %1 项").arg(20000);
-    if (formatName.contains(QStringLiteral("RAR"), Qt::CaseInsensitive)) {
-        text += QStringLiteral("\nRAR/RAR5 仅支持解压；加密、分卷或不受支持的压缩算法会明确报错，"
-                               "本版本不支持创建 RAR。");
-    }
-    m_archiveInfoLabel->setText(text);
+    bool ok = false;
+    const QString password = QInputDialog::getText(
+        this, title, text, QLineEdit::Password, QString(), &ok);
+    if (!ok)
+        return QString();
+    return password;
 }
 
 void MainWindow::cancelCurrentTask()
@@ -948,6 +2037,7 @@ void MainWindow::cancelCurrentTask()
         return;
     m_worker->requestCancel();
     m_cancelButton->setEnabled(false);
+    m_cancelAction->setEnabled(false);
     m_progressLabel->setText(QStringLiteral("正在取消任务…"));
     statusBar()->showMessage(QStringLiteral("正在取消后台任务…"));
     appendLog(QStringLiteral("已请求取消当前任务。"));
@@ -977,6 +2067,8 @@ QString MainWindow::operationLabel(int operation)
         return QStringLiteral("解压");
     case ArchiveWorker::Compress:
         return QStringLiteral("压缩");
+    case ArchiveWorker::Test:
+        return QStringLiteral("测试压缩包");
     default:
         return QStringLiteral("操作");
     }
@@ -985,4 +2077,10 @@ QString MainWindow::operationLabel(int operation)
 QString MainWindow::firstLine(const QString &text)
 {
     return text.section(QLatin1Char('\n'), 0, 0).left(220);
+}
+
+QString MainWindow::archiveDisplayName(const QString &path)
+{
+    const QFileInfo info(path);
+    return info.fileName().isEmpty() ? path : info.fileName();
 }

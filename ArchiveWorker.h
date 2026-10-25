@@ -18,8 +18,17 @@ struct ArchiveEntry
     bool encrypted = false;
 };
 
+// 压缩参数。format 取值：zip / 7z / tar / tar.gz / tar.xz。
+struct CompressOptions
+{
+    QString format = QStringLiteral("zip");
+    int level = 6;
+    QString password;
+};
+
 Q_DECLARE_METATYPE(ArchiveEntry)
 Q_DECLARE_METATYPE(QVector<ArchiveEntry>)
+Q_DECLARE_METATYPE(CompressOptions)
 
 // 所有耗时操作都在此对象中执行；对象会被移动到独立 QThread。
 class ArchiveWorker : public QObject
@@ -30,7 +39,8 @@ public:
     enum Operation {
         List = 0,
         Extract = 1,
-        Compress = 2
+        Compress = 2,
+        Test = 3
     };
     Q_ENUM(Operation)
 
@@ -40,9 +50,13 @@ public:
     void requestCancel();
 
 public slots:
-    void listArchive(const QString &archivePath);
-    void extractArchive(const QString &archivePath, const QString &destinationDir);
-    void compressToZip(const QStringList &sources, const QString &zipPath);
+    void listArchive(const QString &archivePath, const QString &password = QString());
+    void extractArchive(const QString &archivePath, const QString &destinationDir,
+                        const QString &password = QString(),
+                        const QStringList &onlyPaths = QStringList());
+    void testArchive(const QString &archivePath, const QString &password = QString());
+    void compressArchive(const QStringList &sources, const QString &outputPath,
+                         const CompressOptions &options);
 
 signals:
     void progress(int percent, const QString &detail);
@@ -51,6 +65,8 @@ signals:
                 qint64 totalBytes,
                 int entryCount,
                 bool truncated);
+    // 压缩包需要密码，或用户提供的密码不正确。UI 可提示后重试。
+    void passwordRequired(int operation, const QString &archivePath);
     void finished(int operation,
                   bool success,
                   bool canceled,

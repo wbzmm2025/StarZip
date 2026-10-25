@@ -1,189 +1,147 @@
-# StarZip 0.0.1
+# StarZip 0.0.2
 
 StarZip 是一个基于 **C++17 + Qt 6 Widgets + libarchive** 的 Windows 优先桌面压缩/解压工具。
-0.0.1 聚焦一条高频路径：**拖入压缩包 → 解压到当前/指定目录 → 完成**，同时支持把文件或文件夹
-流式压缩为 ZIP。压缩/解压全部在后台线程执行，UI 不阻塞。
+0.0.2 在 0.0.1 的基础上补齐了压缩能力与密码支持，并把界面重做成接近 WinRAR / 7-Zip
+的常规桌面工具：菜单栏、工具栏、路径卡片、压缩包树形列表、压缩设置与任务日志。
 
-## 功能清单
+所有压缩/解压/测试操作都在后台 `QThread` 中执行，UI 不阻塞，可随时取消。
 
-- 拖拽本地压缩包到窗口，libarchive 自动识别格式（ZIP、7Z、RAR/RAR5、TAR 等）
-- “选择文件…”打开压缩包
-- 压缩包内容列表（名称、大小、修改时间、加密标记）
-- 默认解压到 StarZip 启动时的当前目录，可编辑/浏览目标目录
-- “解压到此处”一键解压；“解压到…”选择目标目录并立即解压
-- 选取文件/文件夹后压缩为 `.zip`（64 KiB 分块流式读写，不整包进内存）
-- 实时进度条、状态栏、任务日志、取消任务
-- 后台 `QThread` 执行，信号槽回传进度与结果；关闭任务中的窗口会先请求取消
-- 可读错误提示：弹窗 + 状态栏双通道，包含 libarchive 错误码及中文解释
+## 0.0.2 功能
+
+### 打开与浏览
+
+- 拖拽压缩包到窗口任意位置打开
+- “打开压缩包…”文件对话框，或启动参数 `StarZip.exe <压缩包路径>`
+- 自动识别 ZIP、7Z、RAR / RAR5、TAR、GZ、TGZ、BZ2、XZ、LZMA、CAB、ISO 等格式
+- 树形条目列表（名称、大小、类型、修改时间、加密标记），文件夹可展开/折叠
+- 按名称实时筛选
+- 最近文件菜单（最多 8 条，`QSettings` 持久化）
+- 状态栏显示格式、条目数、解压后大小与任务状态
+
+### 解压与校验
+
+- “解压到此处”解压到路径卡片中的目标目录（默认启动目录）
+- “解压到…”选择目录后立即解压
+- 选择性解压：在树中选中文件/文件夹后“解压选中项…”
+- “测试压缩包”完整读取数据并校验 CRC，报告是否损坏
+- 读取加密 ZIP / 7Z / RAR 时弹出密码框，最多重试 3 次
+- 上下文菜单：复制条目路径、解压选中项、测试压缩包
+- 完成后提示结果，可直接打开输出文件夹
+
+### 压缩
+
+- 输出格式：**ZIP、7Z、TAR、TAR.GZ、TAR.XZ**
+- 可添加多个文件或整个文件夹，支持移除/清空待压缩列表
+- 压缩级别 1–9
+- ZIP 密码：优先 **AES-256**；运行库不支持时自动回退 **ZipCrypto**
+- 输出路径留空时按格式与当前时间自动生成；可手动浏览指定
+- 64 KiB 分块流式读写，不把整包读入内存
+- 7Z 使用 LZMA2；TAR 系列适合跨平台归档
+
+### 安全与可靠性
+
 - 路径穿越防护：拒绝绝对路径、盘符、`..`、NTFS 数据流等不安全条目
-- 符号链接/特殊文件跳过并提示；不跟随链接到目标目录外
-- RAR/7Z 不支持项显式报错，不静默失败
+- 符号链接/特殊文件跳过并提示，不跟随链接写出目标目录
+- 后台任务支持取消；关闭窗口前会先请求取消并等待线程结束
+- libarchive 错误码 + 中文解释，弹窗与状态栏双通道提示
+- 不支持的功能显式报错，不静默失败
 
-明确不在 0.0.1 范围：加密/密码、分卷、修复、格式互转、右键菜单、命令行、主题切换、
-RAR 专有写入、创建 RAR/7Z。
+## 格式支持矩阵
+
+| 格式 | 读取/解压 | 创建 | 创建时密码 |
+| --- | --- | --- | --- |
+| ZIP | ✅ | ✅ | ✅ AES-256 / ZipCrypto |
+| 7Z | ✅ | ✅ | ❌（UI 明确提示改用 ZIP） |
+| RAR / RAR5 | ✅ | ❌ | 仅读取时支持密码 |
+| TAR | ✅ | ✅ | ❌ |
+| TAR.GZ / TGZ | ✅ | ✅ | ❌ |
+| TAR.XZ | ✅ | ✅ | ❌ |
+| GZ / BZ2 / XZ / LZMA / CAB / ISO | ✅ | ❌ | 视格式而定 |
+
+明确不在 0.0.2 范围：分卷、修复、格式互转、右键菜单集成、RAR 创建、主题切换、
+完整命令行接口（仅支持启动时打开一个压缩包）。
+
+## 从源码构建
+
+依赖：
+
+- CMake ≥ 3.20
+- C++17 编译器（Windows 推荐 MinGW-w64 13.1 或 MSVC）
+- Qt 6.3+（Widgets）
+- libarchive 3.6+（需要启用 zlib / lzma；ZIP AES 由 libarchive 的加密后端提供）
+
+```powershell
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+  "-DCMAKE_PREFIX_PATH=C:/path/to/Qt/6.9.3/mingw_64;C:/path/to/libarchive" `
+  -DSTARZIP_BUILD_TESTS=ON
+cmake --build build
+```
+
+运行自检（需要把 libarchive 与 Qt 的 `bin` 加入 `PATH`）：
+
+```powershell
+$env:PATH = "C:\path\to\libarchive\bin;$env:PATH"
+.\build\StarZipSelfTest.exe .\tests\samples\sample.7z `
+  .\tests\samples\test_read_format_rar_compress_normal.rar `
+  .\tests\samples\test_read_format_rar_unicode.rar `
+  .\tests\samples\test_read_format_rar5_multiple_files.rar `
+  .\tests\samples\test_read_format_rar5_stored.rar
+```
+
+自检覆盖列表、解压、压缩（ZIP / 7Z / TAR / TAR.GZ / TAR.XZ）、ZIP AES-256 密码、
+7Z 中文路径往返、选择性解压、CRC 测试、Zip Slip 防护与 RAR/RAR5 读取。
+0.0.2 当前结果：**97 项检查全部通过**。
+
+### 打包
+
+```powershell
+cmake --install build --prefix "<绝对路径>/dist/StarZip-0.0.2-win64"
+```
+
+`bin/` 中需要同时包含 `libarchive.dll`、`liblzma.dll`、`libzlib.dll`。二进制发行包
+不再提交到 Git 仓库，请以本地打包或自行构建为准。
+
+## libarchive 7Z 中文文件名补丁（重要）
+
+libarchive 3.8.2 在 Windows 上创建 7Z 时，会经过当前 locale 把路径转换为 UTF-16LE。
+由于 Windows 的 locale 不能是 UTF-8，非 ASCII 文件名会被静默转换成空字符串，生成的
+7Z 头部损坏：7-Zip 等工具可能仍能勉强读取，但 libarchive 自己会报
+`Damaged 7-Zip archive`。
+
+补丁 `libarchive-7z-utf8.patch` 在
+`libarchive/archive_write_set_format_7zip.c` 的 `file_new()` 中直接调用
+`MultiByteToWideChar(CP_UTF8, ...)` 完成 UTF-8 → UTF-16LE 转换，其余情况仍走原有路径。
+
+```powershell
+# 在 libarchive 源码根目录
+git apply -p1 /path/to/StarZip/libarchive-7z-utf8.patch
+cmake -S . -B build-starzip -G Ninja -DCMAKE_BUILD_TYPE=Release `
+  -DBUILD_SHARED_LIBS=ON -DENABLE_TEST=OFF -DENABLE_TAR=OFF -DENABLE_CPIO=OFF `
+  -DENABLE_CAT=OFF -DENABLE_UNZIP=OFF
+cmake --build build-starzip
+cmake --install build-starzip --prefix C:/path/to/libarchive-install
+```
+
+补丁已在 libarchive 3.8.2 上验证可干净应用并往返一致。
 
 ## 目录结构
 
 ```text
 StarZip/
 ├─ CMakeLists.txt
-├─ main.cpp
-├─ MainWindow.h / MainWindow.cpp
-├─ ArchiveWorker.h / ArchiveWorker.cpp
+├─ main.cpp                         # 入口；支持 StarZip.exe <压缩包>
+├─ MainWindow.h / MainWindow.cpp    # UI、交互、后台任务调度
+├─ ArchiveWorker.h / ArchiveWorker.cpp  # libarchive 读写、密码、测试、取消
+├─ libarchive-7z-utf8.patch         # 7Z 中文文件名修复
 ├─ vcpkg.json
-├─ README.md
 ├─ .gitignore
-├─ tests/
-│  ├─ selftest.cpp                 # 无 GUI 核心自检程序
-│  └─ samples/                     # 7Z / RAR / RAR5 / Zip Slip 测试包
-└─ dist/
-   └─ StarZip-0.0.1-win64/
-      ├─ bin/
-      │  ├─ StarZip.exe            # 可直接双击运行
-      │  ├─ libarchive.dll
-      │  ├─ liblzma.dll
-      │  ├─ libzlib.dll
-      │  ├─ Qt6*.dll               # Qt 运行库
-      │  └─ qt.conf
-      └─ plugins/                  # Qt 平台/图片/样式/TLS 插件
+└─ tests/
+   ├─ selftest.cpp                  # 无 GUI 核心自检
+   └─ samples/                      # 7Z / RAR / RAR5 / Zip Slip 测试包
 ```
 
-`MainWindow` 只负责界面、线程调度和提示；`ArchiveWorker` 封装 libarchive 的列表、解压、ZIP
-压缩逻辑，所有 libarchive 句柄使用 RAII 管理。
+## 版本历史
 
-## 依赖安装（vcpkg，完整命令）
-
-以 PowerShell、64 位 Windows 为例：
-
-```powershell
-# 1. 安装 vcpkg（只需一次）
-git clone https://github.com/microsoft/vcpkg.git M:\vcpkg
-M:\vcpkg\bootstrap-vcpkg.bat
-
-# 2. 安装 Qt6（qtbase 含 Widgets）和 libarchive
-M:\vcpkg\vcpkg install qtbase:x64-windows libarchive:x64-windows
-
-# 3. 可选：集成到用户级 CMake
-M:\vcpkg\vcpkg integrate install
-```
-
-本项目带 `vcpkg.json`（manifest），也可以在项目根目录执行：
-
-```powershell
-M:\vcpkg\vcpkg install --triplet x64-windows
-```
-
-> vcpkg 会有较多依赖且 Qt6 默认从源码编译，首次安装耗时较长属正常现象。
-> 若本机已安装官方 Qt 6.9.3 MinGW，也可以直接使用 Qt 的 CMake 包，见下一节。
-
-## Windows 构建与运行
-
-### 方案 A：使用 vcpkg（推荐给全新环境）
-
-```powershell
-cd M:\Users\Administrator\Desktop\StarZip
-
-cmake -S . -B build -G Ninja `
-  -DCMAKE_BUILD_TYPE=Release `
-  -DCMAKE_TOOLCHAIN_FILE=M:/vcpkg/scripts/buildsystems/vcpkg.cmake `
-  -DCMAKE_PREFIX_PATH=M:/vcpkg/installed/x64-windows
-
-cmake --build build
-
-# 运行（构建目录）
-.\build\StarZip.exe
-```
-
-如使用 Visual Studio 生成器，把 `-G Ninja` 换成 `-G "Visual Studio 17 2022" -A x64`，
-并去掉 `CMAKE_BUILD_TYPE`（或使用 `--config Release`）。
-
-### 方案 B：使用官方 Qt MinGW 预编译包 + 自编译 libarchive（本次实际验证）
-
-本次交付实测环境：
-
-| 组件 | 路径 / 版本 |
-| --- | --- |
-| Qt | `C:\StarZipDeps\Qt\6.9.3\mingw_64`（6.9.3 MinGW 64-bit） |
-| MinGW | `C:\StarZipDeps\mingw1310\Tools\mingw1310_64`（GCC 13.1，与 Qt 预编译包 ABI 匹配） |
-| libarchive | `C:\StarZipDeps\install`（3.8.2，含 zlib 1.3.1、xz 5.8.1，启用 RAR/RAR5/7Z 读取） |
-
-```powershell
-$env:PATH = "C:\StarZipDeps\Qt\6.9.3\mingw_64\bin;C:\StarZipDeps\mingw1310\Tools\mingw1310_64\bin;" + $env:PATH
-cd M:\Users\Administrator\Desktop\StarZip
-
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
-  "-DCMAKE_PREFIX_PATH=C:/StarZipDeps/Qt/6.9.3/mingw_64;C:/StarZipDeps/install" `
-  "-DCMAKE_C_COMPILER=C:/StarZipDeps/mingw1310/Tools/mingw1310_64/bin/gcc.exe" `
-  "-DCMAKE_CXX_COMPILER=C:/StarZipDeps/mingw1310/Tools/mingw1310_64/bin/g++.exe"
-
-cmake --build build
-.\build\StarZip.exe
-```
-
-> 注意：Qt 6.9.3 的 MinGW 预编译包必须搭配 GCC 13.1。使用其他 ABI 的编译器会出现
-> `undefined reference to '__imp___argc'` 等链接错误。
-
-如果 libarchive 安装在自定义目录，请把该目录加入 `CMAKE_PREFIX_PATH`，或通过
-`-DLIBARCHIVE_INCLUDE_DIR=... -DLIBARCHIVE_LIBRARY=...` 指定。
-
-### 部署到独立目录
-
-`cmake --install` 的 prefix 必须是**绝对路径**（Qt 部署脚本要求），例如：
-
-```powershell
-cmake --install build --prefix "M:/Users/Administrator/Desktop/StarZip/dist/StarZip-0.0.1-win64"
-
-# 若 libarchive 为动态库，补齐其运行时依赖
-Copy-Item C:\StarZipDeps\install\bin\libarchive.dll,`
-          C:\StarZipDeps\install\bin\liblzma.dll,`
-          C:\StarZipDeps\install\bin\libzlib.dll `
-          dist\StarZip-0.0.1-win64\bin\ -Force
-```
-
-`dist/StarZip-0.0.1-win64/bin/StarZip.exe` 已包含实测可运行的完整 DLL 集合，可直接双击
-或在未安装 Qt 的机器上运行（需 64 位 Windows 10/11）。
-
-## 核心自检（无 GUI）
-
-```powershell
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTARZIP_BUILD_TESTS=ON `
-  "-DCMAKE_PREFIX_PATH=C:/StarZipDeps/Qt/6.9.3/mingw_64;C:/StarZipDeps/install"
-
-cmake --build build
-
-.\build\StarZipSelfTest.exe `
-  .\tests\samples\sample.7z `
-  .\tests\samples\test_read_format_rar_compress_normal.rar `
-  .\tests\samples\test_read_format_rar5_multiple_files.rar `
-  .\tests\samples\test_read_format_rar_unicode.rar
-```
-
-### 本次实测结果
-
-- `RESULT: ALL PASSED`（退出码 0）
-- ZIP 压缩：5 个条目，含中文路径、子目录、3 MiB 随机二进制
-- ZIP 格式识别正确；解压后 3 个文件 SHA-256 与源文件完全一致
-- 7Z：识别为 `7-Zip`，列出 3 个条目，解压 2 个文件成功
-- RAR：识别为 `RAR`，列出 6 个条目，解压成功（1 个符号链接按安全策略跳过）
-- RAR5：多个文件列表/解压成功，中文文件名正常
-- 非压缩包：被拒绝并返回可读错误码（42 = 格式无法识别）
-- Zip Slip：`../../evil.txt` 被拒绝，同包内 `safe.txt` 正常解压
-- GUI 端到端：打开 `sample.7z` → 显示 `格式：7-Zip`、3 个条目 → 默认目标目录 →
-  “解压到此处” → 进度 100% → “解压成功”弹窗 → 目标目录文件与预期一致
-
-## 已知限制
-
-- **RAR**：libarchive 3.8.2 支持常见 RAR/RAR5 读取；加密 RAR、分卷 RAR、使用了不支持压缩算法的
-  RAR 会失败并给出明确提示。0.0.1 不支持创建 RAR（产品范围仅创建 ZIP）。
-- **7Z**：支持读取常见 7z；加密 7z 和 libarchive 未编译编码器的 7z 会明确报错，不提供密码输入。
-- **压缩格式**：仅创建 ZIP；RAR/7Z 的“解压、列表、进度、错误提示”等读取侧功能一致。
-- **文件名编码**：非 UTF-8 的旧式 ZIP（如未设置 UTF-8 标志的 GBK 名称）显示效果取决于 libarchive
-  的系统编码转换；StarZip 自身创建的 ZIP 使用 UTF-8 名称。
-- **符号链接**：出于安全考虑不创建符号链接/硬链接，跳过并计数提示。
-- **路径安全**：跳过绝对路径与 `..` 越界条目，避免 Zip Slip。
-- 不实现密码、分卷、修复、右键菜单、CLI、主题切换。
-- 目录扫描发生在后台线程；极大目录在扫描阶段只显示“正在扫描”，写出阶段才显示百分比。
-
-## Git 备份
-
-本目录已初始化 Git 仓库，`v0.0.1` 标签指向包含全部源码、测试样例与可运行成品的提交。
+- **0.0.2**：压缩格式扩展（ZIP/7Z/TAR/TAR.GZ/TAR.XZ）、ZIP 密码、密码解压重试、
+  选择性解压、CRC 测试、最近文件、筛选、启动参数、全新专业 UI。
+- **0.0.1**：拖拽/对话框打开压缩包，列表与解压，ZIP 压缩，后台任务与取消。
