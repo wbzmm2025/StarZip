@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(StarZip VERSION 0.0.3 LANGUAGES CXX)
+project(StarZip VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -52,6 +52,8 @@ qt_add_executable(StarZip
     ExternalEngine.cpp
     ShellIntegration.h
     ShellIntegration.cpp
+    ZPack.h
+    ZPack.cpp
 )
 
 target_link_libraries(StarZip PRIVATE Qt6::Widgets)
@@ -94,6 +96,8 @@ if(STARZIP_BUILD_TESTS)
         ExternalEngine.cpp
         ShellIntegration.h
         ShellIntegration.cpp
+        ZPack.h
+        ZPack.cpp
     )
     target_include_directories(StarZipSelfTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(StarZipSelfTest PRIVATE Qt6::Core)
@@ -101,6 +105,14 @@ if(STARZIP_BUILD_TESTS)
         target_link_libraries(StarZipSelfTest PRIVATE shell32)
     endif()
     starzip_link_libarchive(StarZipSelfTest)
+
+    qt_add_executable(ZPackTool
+        tests/zpack_cli.cpp
+        ZPack.h
+        ZPack.cpp
+    )
+    target_include_directories(ZPackTool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(ZPackTool PRIVATE Qt6::Core)
 endif()
 
 include(GNUInstallDirs)

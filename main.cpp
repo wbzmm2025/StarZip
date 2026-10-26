@@ -7,7 +7,7 @@ int main(int argc, char *argv[])
 {
     QApplication app(argc, argv);
     QCoreApplication::setApplicationName(QStringLiteral("StarZip"));
-    QCoreApplication::setApplicationVersion(QStringLiteral("0.0.3"));
+    QCoreApplication::setApplicationVersion(QStringLiteral("0.1.0"));
     QCoreApplication::setOrganizationName(QStringLiteral("StarZip"));
 
     MainWindow window;

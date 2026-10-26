@@ -129,9 +129,9 @@ MainWindow::MainWindow(QWidget *parent)
     }
 #endif
 
-    appendLog(QStringLiteral("StarZip 0.0.3 已启动。"));
-    appendLog(QStringLiteral("读取：ZIP / 7Z / RAR / RAR5 / TAR / GZ / XZ / CAB / ISO；"
-                             "创建：ZIP / 7Z / TAR / TAR.GZ / TAR.XZ。"));
+    appendLog(QStringLiteral("StarZip 0.1.0 已启动。"));
+    appendLog(QStringLiteral("读取：ZIP / 7Z / RAR / RAR5 / TAR / GZ / XZ / CAB / ISO / ZPack；"
+                             "创建：ZIP / 7Z / TAR / TAR.GZ / TAR.XZ / ZPack。"));
     appendLog(QStringLiteral("密码：ZIP 支持 AES-256 写入；加密 ZIP / 7Z / RAR 可输入密码解压。"));
     appendLog(ExternalEngine::available()
                   ? QStringLiteral("7-Zip 引擎：%1（支持 UDF ISO 与加密 7Z）")
@@ -154,7 +154,7 @@ MainWindow::~MainWindow()
 
 void MainWindow::setupUi()
 {
-    setWindowTitle(QStringLiteral("StarZip 0.0.3"));
+    setWindowTitle(QStringLiteral("StarZip 0.1.0"));
     setWindowIcon(makeAppIcon());
     resize(900, 600);
     setMinimumSize(760, 500);
@@ -248,7 +248,7 @@ void MainWindow::setupUi()
     statusBar()->showMessage(QStringLiteral("就绪"));
     m_statusFormatLabel = new QLabel(QStringLiteral("格式：—"), this);
     m_statusCountLabel = new QLabel(QStringLiteral("条目：—"), this);
-    auto *versionLabel = new QLabel(QStringLiteral("StarZip 0.0.3"), this);
+    auto *versionLabel = new QLabel(QStringLiteral("StarZip 0.1.0"), this);
     statusBar()->addPermanentWidget(m_statusFormatLabel);
     statusBar()->addPermanentWidget(m_statusCountLabel);
     statusBar()->addPermanentWidget(versionLabel);
@@ -436,7 +436,7 @@ QWidget *MainWindow::createEmptyPage()
 
     m_emptyHint = new QLabel(
         QStringLiteral("支持从本地浏览选择，也可以直接把压缩包拖到窗口。\n"
-                       "ZIP / 7Z / RAR 的解压、列表、进度与密码提示保持一致。"),
+                       "ZIP / 7Z / RAR / ZPack 的解压、列表、进度与密码提示保持一致。"),
         m_emptyPage);
     m_emptyHint->setObjectName(QStringLiteral("emptyHint"));
     m_emptyHint->setAlignment(Qt::AlignCenter);
@@ -444,7 +444,8 @@ QWidget *MainWindow::createEmptyPage()
     layout->addWidget(m_emptyHint);
 
     m_emptyFormats = new QLabel(
-        QStringLiteral("ZIP · 7Z · RAR · RAR5 · TAR · GZ · XZ · CAB · ISO"), m_emptyPage);
+        QStringLiteral("ZIP · 7Z · RAR · RAR5 · TAR · GZ · XZ · CAB · ISO · ZPACK"),
+        m_emptyPage);
     m_emptyFormats->setObjectName(QStringLiteral("emptyFormats"));
     m_emptyFormats->setAlignment(Qt::AlignCenter);
     layout->addWidget(m_emptyFormats);
@@ -644,8 +645,8 @@ QWidget *MainWindow::createCompressPage()
     grid->addWidget(m_browseOutputButton, 2, 3);
 
     auto *compressHint = new QLabel(
-        QStringLiteral("ZIP 支持 AES-256 密码；7Z 使用 LZMA2；TAR 系列适合跨平台归档。"
-                       "创建 RAR 不在本版本范围内。"),
+        QStringLiteral("ZIP 支持 AES-256 密码；7Z 使用 LZMA2；ZPack 是单文件自有算法；"
+                       "TAR 系列适合跨平台归档。创建 RAR 不在本版本范围内。"),
         settingsBox);
     compressHint->setObjectName(QStringLiteral("mutedLabel"));
     compressHint->setWordWrap(true);
@@ -1043,7 +1044,7 @@ void MainWindow::chooseArchive()
                               .toString();
     const QString path = QFileDialog::getOpenFileName(
         this, QStringLiteral("打开压缩包"), start,
-        QStringLiteral("压缩包 (*.zip *.7z *.rar *.tar *.gz *.tgz *.bz2 *.xz *.lzma *.cab *.iso);;"
+        QStringLiteral("压缩包 (*.zip *.7z *.stz *.rar *.tar *.gz *.tgz *.bz2 *.xz *.lzma *.cab *.iso);;"
                        "所有文件 (*.*)"));
     if (path.isEmpty())
         return;
@@ -1088,7 +1089,7 @@ void MainWindow::openArchive(const QString &path, const QString &password, bool 
     m_tabs->setCurrentWidget(m_archivePage);
     m_statusFormatLabel->setText(QStringLiteral("格式：读取中"));
     m_statusCountLabel->setText(QStringLiteral("条目：—"));
-    setWindowTitle(QStringLiteral("StarZip 0.0.3 — %1").arg(archiveDisplayName(m_archivePath)));
+    setWindowTitle(QStringLiteral("StarZip 0.1.0 — %1").arg(archiveDisplayName(m_archivePath)));
     appendLog(QStringLiteral("打开压缩包：%1").arg(QDir::toNativeSeparators(m_archivePath)));
 
     const QString archivePath = m_archivePath;
@@ -1383,6 +1384,8 @@ QVector<MainWindow::FormatChoice> MainWindow::formatChoices()
          QStringLiteral("TAR.GZ 压缩包 (*.tar.gz)"), false, true},
         {QStringLiteral("tar.xz"), QStringLiteral("TAR.XZ（.tar.xz）"), QStringLiteral(".tar.xz"),
          QStringLiteral("TAR.XZ 压缩包 (*.tar.xz)"), false, true},
+        {QStringLiteral("stz"), QStringLiteral("ZPack（.stz）"), QStringLiteral(".stz"),
+         QStringLiteral("ZPack 压缩包 (*.stz)"), false, false},
     };
 }
 
@@ -1399,7 +1402,7 @@ QString MainWindow::replaceSuffix(const QString &path, const QString &suffix)
         return path;
     static const QStringList known = {QStringLiteral(".tar.gz"), QStringLiteral(".tar.xz"),
                                       QStringLiteral(".zip"), QStringLiteral(".7z"),
-                                      QStringLiteral(".tar")};
+                                      QStringLiteral(".stz"), QStringLiteral(".tar")};
     QString base = path;
     for (const QString &ending : known) {
         if (base.endsWith(ending, Qt::CaseInsensitive)) {
@@ -1427,6 +1430,9 @@ void MainWindow::onFormatChanged()
             ExternalEngine::available()
                 ? QStringLiteral("7Z 密码由 7-Zip 引擎写入（AES-256）；留空则不加密。")
                 : QStringLiteral("未找到 7-Zip 引擎，7Z 暂不能设置密码；请选择 ZIP。"));
+    } else if (choice.id == QStringLiteral("stz")) {
+        m_passwordNote->setText(QStringLiteral("ZPack 是单文件无损压缩，不支持密码；"
+                                               "只能选择一个普通文件。"));
     } else {
         m_passwordNote->setText(QStringLiteral("TAR 系列不支持密码，适合跨平台归档。"));
     }
@@ -1489,6 +1495,17 @@ void MainWindow::createArchive()
 
     const FormatChoice choice = currentFormatChoice();
     const QString password = choice.supportsPassword ? m_passwordEdit->text() : QString();
+
+    if (choice.id == QStringLiteral("stz")) {
+        if (sources.size() != 1 || QFileInfo(sources.first()).isDir()) {
+            QMessageBox::information(
+                this, QStringLiteral("ZPack 仅支持单文件"),
+                QStringLiteral("ZPack（.stz）是单文件压缩格式，只选择一个普通文件。\n"
+                               "文件夹或多个来源请改用 ZIP / 7Z / TAR 格式。"));
+            m_tabs->setCurrentWidget(m_compressPage);
+            return;
+        }
+    }
 
     QString output = m_outputEdit->text().trimmed();
     if (output.isEmpty()) {
@@ -1757,15 +1774,16 @@ void MainWindow::showAbout()
     box.setIcon(QMessageBox::Information);
     box.setTextFormat(Qt::RichText);
     box.setText(QStringLiteral(
-        "<h3>StarZip 0.0.3</h3>"
-        "<p>C++17 · Qt 6 Widgets · libarchive</p>"
-        "<p>读取：ZIP / 7Z / RAR / RAR5 / TAR / GZ / XZ / CAB / ISO / UDF ISO<br>"
-        "创建：ZIP / 7Z / TAR / TAR.GZ / TAR.XZ<br>"
+        "<h3>StarZip 0.1.0</h3>"
+        "<p>C++17 · Qt 6 Widgets · libarchive · ZPack</p>"
+        "<p>读取：ZIP / 7Z / RAR / RAR5 / TAR / GZ / XZ / CAB / ISO / UDF ISO / ZPack<br>"
+        "创建：ZIP / 7Z / TAR / TAR.GZ / TAR.XZ / ZPack<br>"
         "密码：ZIP AES-256 写入；7Z 密码由 7-Zip 引擎写入；加密包读取时可输入密码<br>"
         "集成：Windows 资源管理器右键菜单 / 打开方式</p>"
         "<p>GitHub：<a href='https://github.com/wbzmm2025/StarZip'>"
         "github.com/wbzmm2025/StarZip</a></p>"
-        "<p style='color:#6b7280'>0.0.3：右键菜单、UDF ISO、加密 7Z 与紧凑窗口。</p>"));
+        "<p style='color:#6b7280'>0.1.0：新增 ZPack（.stz）分块自适应 LZ77 + 规范 Huffman "
+        "压缩格式，带 CRC32 与存储回退。</p>"));
     box.setStandardButtons(QMessageBox::Ok);
     box.exec();
 }
@@ -1858,9 +1876,9 @@ void MainWindow::onArchiveListed(const QVector<ArchiveEntry> &entries,
     m_archiveStack->setCurrentWidget(m_contentPage);
     m_emptyTitle->setText(QStringLiteral("打开或拖入一个压缩包"));
     m_emptyHint->setText(QStringLiteral("支持从本地浏览选择，也可以直接把压缩包拖到窗口。\n"
-                                        "ZIP / 7Z / RAR 的解压、列表、进度与密码提示保持一致。"));
+                                        "ZIP / 7Z / RAR / ZPack 的解压、列表、进度与密码提示保持一致。"));
     m_emptyFormats->setText(
-        QStringLiteral("ZIP · 7Z · RAR · RAR5 · TAR · GZ · XZ · CAB · ISO"));
+        QStringLiteral("ZIP · 7Z · RAR · RAR5 · TAR · GZ · XZ · CAB · ISO · ZPACK"));
     m_tabs->setCurrentWidget(m_archivePage);
     addRecentFile(m_archivePath);
     updateStatusInfo();
@@ -2043,11 +2061,11 @@ void MainWindow::resetArchiveState()
         m_emptyTitle->setText(QStringLiteral("打开或拖入一个压缩包"));
     if (m_emptyHint) {
         m_emptyHint->setText(QStringLiteral("支持从本地浏览选择，也可以直接把压缩包拖到窗口。\n"
-                                            "ZIP / 7Z / RAR 的解压、列表、进度与密码提示保持一致。"));
+                                            "ZIP / 7Z / RAR / ZPack 的解压、列表、进度与密码提示保持一致。"));
     }
     if (m_emptyFormats) {
         m_emptyFormats->setText(
-            QStringLiteral("ZIP · 7Z · RAR · RAR5 · TAR · GZ · XZ · CAB · ISO"));
+            QStringLiteral("ZIP · 7Z · RAR · RAR5 · TAR · GZ · XZ · CAB · ISO · ZPACK"));
     }
     m_archiveLabel->setText(QStringLiteral("未选择"));
     m_archiveLabel->setToolTip(QString());
@@ -2055,7 +2073,7 @@ void MainWindow::resetArchiveState()
     m_formatBadge->setText(QStringLiteral("—"));
     m_statusFormatLabel->setText(QStringLiteral("格式：—"));
     m_statusCountLabel->setText(QStringLiteral("条目：—"));
-    setWindowTitle(QStringLiteral("StarZip 0.0.3"));
+    setWindowTitle(QStringLiteral("StarZip 0.1.0"));
     updateActions();
 }
 
@@ -2118,6 +2136,8 @@ void MainWindow::updateStatusInfo()
         badge = QStringLiteral("RAR");
     else if (badge.contains(QStringLiteral("TAR"), Qt::CaseInsensitive))
         badge = QStringLiteral("TAR");
+    else if (badge.contains(QStringLiteral("ZPack"), Qt::CaseInsensitive))
+        badge = QStringLiteral("ZPACK");
     else if (badge.isEmpty())
         badge = QStringLiteral("—");
     m_statusFormatLabel->setText(QStringLiteral("格式：%1").arg(badge));
@@ -2142,6 +2162,8 @@ void MainWindow::updateArchiveHeader(const QString &formatName, qint64 totalByte
         badge = QStringLiteral("TAR");
     else if (formatName.contains(QStringLiteral("ZIP"), Qt::CaseInsensitive))
         badge = QStringLiteral("ZIP");
+    else if (formatName.contains(QStringLiteral("ZPack"), Qt::CaseInsensitive))
+        badge = QStringLiteral("ZPACK");
     else
         badge = formatName.section(QLatin1Char(' '), 0, 0).toUpper();
     m_formatBadge->setText(badge);

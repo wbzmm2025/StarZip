@@ -1,11 +1,12 @@
-// StarZip 核心逻辑自检程序（0.0.2）。
+// StarZip 核心逻辑自检程序（0.1.0）。
 // 直接驱动 ArchiveWorker，不依赖 GUI，用于自动化验证：
-//   ZIP / 7Z / TAR / TAR.GZ / TAR.XZ 创建、列表、解压、校验，
+//   ZIP / 7Z / TAR / TAR.GZ / TAR.XZ / ZPack（.stz）创建、列表、解压、校验，
 //   ZIP 密码（AES-256 / ZipCrypto）、选择性解压、路径穿越防护，
 //   以及外部传入的 7Z / RAR / RAR5 等压缩包读取路径。
 #include "ArchiveWorker.h"
 #include "ExternalEngine.h"
 #include "ShellIntegration.h"
+#include "ZPack.h"
 
 #include <QCoreApplication>
 #include <QCryptographicHash>
@@ -343,7 +344,159 @@ int main(int argc, char *argv[])
               QStringLiteral("缺少 7-Zip 引擎时 7Z 密码被明确拒绝：%1").arg(r.message));
     }
 
-    // ---------- 8. 路径穿越（Zip Slip）防护 ----------
+    // ---------- 8. StarZip 自有 ZPack（.stz） ----------
+    {
+        const QString zdir = work + QStringLiteral("/zpack");
+        QDir().mkpath(zdir);
+        struct Case { QString name; QByteArray data; };
+        QByteArray random(1024 * 1024, Qt::Uninitialized);
+        for (int i = 0; i < random.size(); ++i)
+            random[i] = static_cast<char>(QRandomGenerator::global()->bounded(256));
+        QByteArray boom(1200 * 1024, Qt::Uninitialized);
+        for (int i = 0; i < boom.size(); ++i)
+            boom[i] = static_cast<char>((i * 37 + (i >> 9) * 11) & 0xff);
+        const QVector<Case> cases = {
+            {QStringLiteral("empty.bin"), QByteArray()},
+            {QStringLiteral("one.bin"), QByteArray("X")},
+            {QStringLiteral("two.bin"), QByteArray("XY")},
+            {QStringLiteral("same.bin"), QByteArray(2 * 1024 * 1024, 'A')},
+            {QStringLiteral("single.bin"), QByteArray(1100 * 1024, 'Z')},
+            {QStringLiteral("text.txt"),
+             QStringLiteral("ZPack 文本测试：分块自适应、LZ77、规范 Huffman、CRC32。\n")
+                 .toUtf8()
+                 .repeated(9000)},
+            {QStringLiteral("code.cpp"),
+             QByteArray("int main(int argc, char **argv) { return argc > 1 ? 0 : 1; }\n")
+                 .repeated(12000)},
+            {QStringLiteral("log.txt"),
+             [] {
+                 QByteArray log;
+                 for (int i = 0; i < 60000; ++i)
+                     log += QStringLiteral(
+                                "2026-10-26 INFO worker=%1 task=%2 status=ok elapsed=%3ms\n")
+                                .arg(i % 8)
+                                .arg(i % 97)
+                                .arg((i * 37) % 100000)
+                                .toUtf8();
+                 return log;
+             }()},
+            {QStringLiteral("random.bin"), random},
+            {QStringLiteral("already.zip"),
+             [&] {
+                 QFile zip(work + QStringLiteral("/roundtrip-zip.zip"));
+                 return zip.open(QIODevice::ReadOnly) ? zip.readAll() : QByteArray("PK\3\4");
+             }()},
+            {QStringLiteral("large.bin"), boom},
+        };
+
+        bool allRoundTrips = true;
+        bool storedFallbackSeen = false;
+        bool lzSeen = false;
+        for (const Case &item : cases) {
+            const QString source = zdir + QLatin1Char('/') + item.name;
+            const QString packed = source + QStringLiteral(".stz");
+            const QString restored = source + QStringLiteral(".restored");
+            if (!writeFile(source, item.data)) {
+                check(false, QStringLiteral("ZPack 创建测试数据 %1").arg(item.name));
+                allRoundTrips = false;
+                continue;
+            }
+            QString error;
+            const bool ok = ZPack::compressFile(source, packed, &error);
+            if (!ok) {
+                check(false, QStringLiteral("ZPack 压缩 %1：%2").arg(item.name, error));
+                allRoundTrips = false;
+                continue;
+            }
+            ZPack::Info info;
+            if (!ZPack::inspect(packed, &info, &error)) {
+                check(false, QStringLiteral("ZPack 检查 %1：%2").arg(item.name, error));
+                allRoundTrips = false;
+                continue;
+            }
+            storedFallbackSeen = storedFallbackSeen || info.storedBlocks > 0;
+            lzSeen = lzSeen || info.lzBlocks > 0;
+            if (!ZPack::decompressFile(packed, restored, &error) || !sameHash(source, restored)) {
+                check(false, QStringLiteral("ZPack 往返 %1：%2").arg(item.name, error));
+                allRoundTrips = false;
+                continue;
+            }
+            if (!item.data.isEmpty() && item.data.size() > 4096
+                && info.compressedSize >= quint64(item.data.size()) * 2
+                && item.name != QStringLiteral("random.bin")
+                && item.name != QStringLiteral("already.zip")) {
+                check(false, QStringLiteral("ZPack 可压缩数据未取得收益：%1").arg(item.name));
+                allRoundTrips = false;
+                continue;
+            }
+            if (!ZPack::testFile(packed, &error)) {
+                check(false, QStringLiteral("ZPack CRC %1：%2").arg(item.name, error));
+                allRoundTrips = false;
+                continue;
+            }
+        }
+        check(allRoundTrips, QStringLiteral("ZPack 全部语料压缩/解压/CRC 往返一致"));
+        check(storedFallbackSeen, QStringLiteral("ZPack 随机/已压缩数据触发存储回退"));
+        check(lzSeen, QStringLiteral("ZPack 可压缩数据使用 LZ77 + Huffman 块"));
+
+        const QString oneSource = zdir + QStringLiteral("/one.bin");
+        const QString stzPath = zdir + QStringLiteral("/worker.stz");
+        CompressOptions zopts;
+        zopts.format = QStringLiteral("stz");
+        r = runCompress({oneSource}, stzPath, zopts);
+        check(r.success && QFileInfo::exists(stzPath),
+              QStringLiteral("ArchiveWorker 创建 ZPack：%1").arg(r.message));
+        r = runList(stzPath);
+        check(r.success && r.entryCount == 1 && r.format.contains(QStringLiteral("ZPack")),
+              QStringLiteral("ArchiveWorker 列表 ZPack：%1").arg(r.message));
+        const QString zout = work + QStringLiteral("/zpack-out");
+        r = runExtract(stzPath, zout);
+        check(r.success && sameHash(zout + QStringLiteral("/worker"), oneSource),
+              QStringLiteral("ArchiveWorker 解压 ZPack：%1").arg(r.message));
+        r = runTest(stzPath);
+        check(r.success, QStringLiteral("ArchiveWorker 测试 ZPack CRC：%1").arg(r.message));
+
+        const QString zskip = work + QStringLiteral("/zpack-skip");
+        r = runExtract(stzPath, zskip, QString(), {QStringLiteral("not-selected.bin")});
+        check(r.success && !QFileInfo::exists(zskip + QStringLiteral("/worker")),
+              QStringLiteral("ZPack 选择性解压跳过未选中条目"));
+
+        r = runCompress(sources, zdir + QStringLiteral("/multi.stz"), zopts);
+        check(!r.success && r.message.contains(QStringLiteral("单文件")),
+              QStringLiteral("ZPack 拒绝多来源：%1").arg(r.message));
+        CompressOptions zdirOpts = zopts;
+        r = runCompress({srcRoot}, zdir + QStringLiteral("/dir.stz"), zdirOpts);
+        check(!r.success && r.message.contains(QStringLiteral("单文件")),
+              QStringLiteral("ZPack 拒绝文件夹：%1").arg(r.message));
+        CompressOptions zpwd = zopts;
+        zpwd.password = QStringLiteral("x");
+        r = runCompress({oneSource}, zdir + QStringLiteral("/pwd.stz"), zpwd);
+        check(!r.success && r.message.contains(QStringLiteral("密码")),
+              QStringLiteral("ZPack 拒绝密码：%1").arg(r.message));
+
+        // 篡改最后一个字节，存储块 CRC 必须失败，且不留下半成品输出。
+        const QString corrupt = zdir + QStringLiteral("/corrupt.stz");
+        QFile::copy(stzPath, corrupt);
+        QFile badFile(corrupt);
+        if (badFile.open(QIODevice::ReadWrite) && badFile.size() > 0) {
+            badFile.seek(badFile.size() - 1);
+            char byte = 0;
+            badFile.getChar(&byte);
+            byte = char(byte ^ 0x5a);
+            badFile.seek(badFile.size() - 1);
+            badFile.putChar(byte);
+            badFile.close();
+        }
+        r = runTest(corrupt);
+        check(!r.success && r.message.contains(QStringLiteral("CRC")),
+              QStringLiteral("ZPack CRC 损坏被检测：%1").arg(r.message));
+        const QString corruptDest = work + QStringLiteral("/zpack-corrupt-out");
+        r = runExtract(corrupt, corruptDest);
+        check(!r.success && !QFileInfo::exists(corruptDest + QStringLiteral("/corrupt")),
+              QStringLiteral("ZPack 损坏包不留下半成品输出"));
+    }
+
+    // ---------- 9. 路径穿越（Zip Slip）防护 ----------
     if (qEnvironmentVariableIsSet("STARZIP_TEST_SHELL")) {
         QString shellError;
         const bool ok = ShellIntegration::install(&shellError);

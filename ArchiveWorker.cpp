@@ -1,6 +1,7 @@
 #include "ArchiveWorker.h"
 
 #include "ExternalEngine.h"
+#include "ZPack.h"
 
 #include <QDir>
 #include <QDirIterator>
@@ -145,6 +146,8 @@ QString formatNameFromSuffix(const QString &archivePath)
         return QStringLiteral("CAB");
     if (suffix == QStringLiteral("iso"))
         return QStringLiteral("ISO9660");
+    if (suffix == QStringLiteral("stz"))
+        return QStringLiteral("ZPack");
     return QString();
 }
 
@@ -160,6 +163,8 @@ QString formatLabel(const QString &format)
         return QStringLiteral("TAR.GZ");
     if (format == QStringLiteral("tar.xz"))
         return QStringLiteral("TAR.XZ");
+    if (format == QStringLiteral("stz"))
+        return QStringLiteral("ZPACK");
     return format.toUpper();
 }
 
@@ -588,6 +593,45 @@ void ArchiveWorker::listArchive(const QString &archivePath, const QString &passw
 {
     resetCancel();
 
+    if (ZPack::isZPackFile(archivePath)) {
+        if (!password.isEmpty()) {
+            emit finished(List, false, false,
+                          QStringLiteral("ZPack（.stz）是单文件无损压缩格式，不支持密码。\n"
+                                         "请清空密码后重试。"),
+                          0, archivePath);
+            return;
+        }
+        ZPack::Info info;
+        QString error;
+        emit progress(0, QStringLiteral("正在读取 ZPack 文件头…"));
+        if (!ZPack::inspect(archivePath, &info, &error)) {
+            emit finished(List, false, false, error, 0, archivePath);
+            return;
+        }
+        if (isCancelRequested()) {
+            emit finished(List, false, true, QStringLiteral("打开压缩包操作已取消。"), 0,
+                          archivePath);
+            return;
+        }
+        ArchiveEntry item;
+        item.path = ZPack::suggestedOutputName(archivePath);
+        item.size = qint64(info.originalSize);
+        item.modified = QFileInfo(archivePath).lastModified();
+        QVector<ArchiveEntry> entries{item};
+        emit listed(entries, QStringLiteral("ZPack"), qint64(info.originalSize), 1, false);
+        emit progress(100, QStringLiteral("ZPack 文件头读取完成"));
+        emit finished(List, true, false,
+                      QStringLiteral("已识别 1 个条目，格式：ZPack（%1 个块，压缩率 %2%）")
+                          .arg(info.blockCount)
+                          .arg(info.originalSize > 0
+                                   ? QString::number(double(info.compressedSize) * 100.0
+                                                         / double(info.originalSize),
+                                                     'f', 2)
+                                   : QStringLiteral("0")),
+                      0, archivePath);
+        return;
+    }
+
     // UDF 光盘映像（Windows 安装盘等）libarchive 只认得出 ISO9660 兼容层，
     // 必须交给 7-Zip 引擎读取完整目录树。
     // libarchive 3.8 无法读取 AES 加密的 7Z 内容，带密码的 7Z 也改用 7-Zip 引擎。
@@ -747,6 +791,58 @@ void ArchiveWorker::extractArchive(const QString &archivePath, const QString &de
         emit finished(Extract, false, false,
                       QStringLiteral("解压目标不是目录：%1")
                           .arg(QDir::toNativeSeparators(destAbsolute)),
+                      0, destAbsolute);
+        return;
+    }
+
+    if (ZPack::isZPackFile(archivePath)) {
+        if (!password.isEmpty()) {
+            emit finished(Extract, false, false,
+                          QStringLiteral("ZPack（.stz）不支持密码。\n请清空密码后重试。"),
+                          0, destAbsolute);
+            return;
+        }
+        const QString outputName = ZPack::suggestedOutputName(archivePath);
+        if (!onlyPaths.isEmpty()) {
+            bool selected = false;
+            for (const QString &onlyPath : onlyPaths) {
+                if (onlyPath.compare(outputName, pathCaseSensitivity()) == 0
+                    || QFileInfo(onlyPath).fileName().compare(outputName,
+                                                              pathCaseSensitivity())
+                           == 0) {
+                    selected = true;
+                    break;
+                }
+            }
+            if (!selected) {
+                emit progress(100, QStringLiteral("没有选中 ZPack 内的条目"));
+                emit finished(Extract, true, false,
+                              QStringLiteral("没有选中需要解压的条目。\n目标目录：%1")
+                                  .arg(QDir::toNativeSeparators(destAbsolute)),
+                              0, destAbsolute);
+                return;
+            }
+        }
+        const QString outputPath = destAbsolute + QLatin1Char('/') + outputName;
+        ZPack::Progress zpackProgress;
+        zpackProgress.report = [this](int percent, const QString &detail) {
+            emit progress(percent, detail);
+        };
+        QString error;
+        emit progress(0, QStringLiteral("正在解压 ZPack（.stz）…"));
+        if (!ZPack::decompressFile(archivePath, outputPath, &error, &m_cancelRequested,
+                                   zpackProgress)) {
+            const bool canceled = isCancelRequested();
+            emit finished(Extract, false, canceled,
+                          canceled ? QStringLiteral("解压操作已取消。") : error, 0,
+                          destAbsolute);
+            return;
+        }
+        emit progress(100, QStringLiteral("解压完成"));
+        emit finished(Extract, true, false,
+                      QStringLiteral("ZPack 解压完成。\n输出文件：%1\n目标目录：%2")
+                          .arg(QDir::toNativeSeparators(outputPath),
+                               QDir::toNativeSeparators(destAbsolute)),
                       0, destAbsolute);
         return;
     }
@@ -1031,6 +1127,44 @@ void ArchiveWorker::testArchive(const QString &archivePath, const QString &passw
 {
     resetCancel();
 
+    if (ZPack::isZPackFile(archivePath)) {
+        if (!password.isEmpty()) {
+            emit finished(Test, false, false,
+                          QStringLiteral("ZPack（.stz）不支持密码。\n请清空密码后重试。"), 0,
+                          archivePath);
+            return;
+        }
+        ZPack::Progress zpackProgress;
+        zpackProgress.report = [this](int percent, const QString &detail) {
+            emit progress(percent, detail);
+        };
+        QString error;
+        emit progress(0, QStringLiteral("正在校验 ZPack（.stz）…"));
+        if (!ZPack::testFile(archivePath, &error, &m_cancelRequested, zpackProgress)) {
+            const bool canceled = isCancelRequested();
+            emit finished(Test, false, canceled,
+                          canceled ? QStringLiteral("测试操作已取消。") : error, 0, archivePath);
+            return;
+        }
+        ZPack::Info info;
+        QString infoError;
+        QString summary;
+        if (ZPack::inspect(archivePath, &info, &infoError)) {
+            summary = QStringLiteral("块：%1（存储 %2 / Huffman %3 / LZ77 %4）")
+                          .arg(info.blockCount)
+                          .arg(info.storedBlocks)
+                          .arg(info.huffmanBlocks)
+                          .arg(info.lzBlocks);
+        }
+        emit progress(100, QStringLiteral("校验完成"));
+        emit finished(Test, true, false,
+                      QStringLiteral("ZPack 压缩包测试完成，CRC32 全部通过。%1")
+                          .arg(summary.isEmpty() ? QString()
+                                                 : QStringLiteral("\n") + summary),
+                      0, archivePath);
+        return;
+    }
+
     const bool isUdf = ExternalEngine::isUdfIso(archivePath);
     const bool isEncrypted7z =
         !password.isEmpty()
@@ -1198,10 +1332,79 @@ void ArchiveWorker::compressArchive(const QStringList &sources, const QString &o
     const bool isTar = format == QStringLiteral("tar");
     const bool isTarGz = format == QStringLiteral("tar.gz");
     const bool isTarXz = format == QStringLiteral("tar.xz");
+    const bool isStz = format == QStringLiteral("stz");
 
-    if (!isZip && !is7z && !isTar && !isTarGz && !isTarXz) {
+    if (!isZip && !is7z && !isTar && !isTarGz && !isTarXz && !isStz) {
         emit finished(Compress, false, false,
                       QStringLiteral("不支持的输出格式：%1").arg(options.format), 0, outputPath);
+        return;
+    }
+    if (isStz) {
+        if (sources.size() != 1 || !QFileInfo(sources.first()).isFile()) {
+            emit finished(Compress, false, false,
+                          QStringLiteral("ZPack（.stz）是单文件压缩格式，只能选择一个普通文件。\n"
+                                         "文件夹或多个来源请改用 ZIP / 7Z / TAR 格式。"),
+                          0, outputPath);
+            return;
+        }
+        if (!options.password.isEmpty()) {
+            emit finished(Compress, false, false,
+                          QStringLiteral("ZPack（.stz）是自有无损压缩格式，当前不支持密码。\n"
+                                         "请清空密码，或改用 ZIP / 7Z 加密。"),
+                          0, outputPath);
+            return;
+        }
+        if (QFileInfo(outputPath).exists() && QFileInfo(outputPath).isDir()) {
+            emit finished(Compress, false, false,
+                          QStringLiteral("输出路径是文件夹，无法保存压缩包：%1")
+                              .arg(QDir::toNativeSeparators(outputPath)),
+                          0, outputPath);
+            return;
+        }
+        if (!QDir().mkpath(QFileInfo(outputPath).absolutePath())) {
+            emit finished(Compress, false, false,
+                          QStringLiteral("无法创建输出目录：%1")
+                              .arg(QDir::toNativeSeparators(
+                                  QFileInfo(outputPath).absolutePath())),
+                          0, outputPath);
+            return;
+        }
+        ZPack::Progress zpackProgress;
+        zpackProgress.report = [this](int percent, const QString &detail) {
+            emit progress(percent, detail);
+        };
+        QString error;
+        emit progress(0, QStringLiteral("正在使用 ZPack 压缩…"));
+        if (!ZPack::compressFile(sources.first(), outputPath, &error, &m_cancelRequested,
+                                 zpackProgress)) {
+            const bool canceled = isCancelRequested();
+            emit finished(Compress, false, canceled,
+                          canceled ? QStringLiteral("压缩操作已取消。") : error, 0, outputPath);
+            return;
+        }
+        ZPack::Info info;
+        QString infoError;
+        QString summary;
+        if (ZPack::inspect(outputPath, &info, &infoError)) {
+            const double ratio = info.originalSize > 0
+                                     ? double(info.compressedSize) * 100.0
+                                           / double(info.originalSize)
+                                     : 0.0;
+            summary = QStringLiteral("\n原始大小：%1 字节\n压缩后：%2 字节（%3%）\n"
+                                     "块：%4（存储 %5 / Huffman %6 / LZ77 %7）")
+                          .arg(info.originalSize)
+                          .arg(info.compressedSize)
+                          .arg(ratio, 0, 'f', 2)
+                          .arg(info.blockCount)
+                          .arg(info.storedBlocks)
+                          .arg(info.huffmanBlocks)
+                          .arg(info.lzBlocks);
+        }
+        emit progress(100, QStringLiteral("ZPack 压缩完成"));
+        emit finished(Compress, true, false,
+                      QStringLiteral("ZPack 压缩完成。\n输出文件：%1%2")
+                          .arg(QDir::toNativeSeparators(outputPath), summary),
+                      0, outputPath);
         return;
     }
     if (!options.password.isEmpty() && !isZip && !is7z) {

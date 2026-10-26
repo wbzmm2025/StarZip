@@ -19,7 +19,7 @@ const QStringList kArchiveExtensions = {
     QStringLiteral(".zip"),  QStringLiteral(".7z"),  QStringLiteral(".rar"),
     QStringLiteral(".tar"),  QStringLiteral(".gz"),  QStringLiteral(".tgz"),
     QStringLiteral(".bz2"),  QStringLiteral(".xz"),  QStringLiteral(".lzma"),
-    QStringLiteral(".cab"),  QStringLiteral(".iso"),
+    QStringLiteral(".cab"),  QStringLiteral(".iso"),  QStringLiteral(".stz"),
 };
 
 QString applicationPath()
